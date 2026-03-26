@@ -76,7 +76,7 @@ class PromptDET(nn.Module):
             branch["logit_scale"] = logit_scale
         return branches
 
-    def _decode_branch(self, outputs: Dict[str, List[torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def _decode_branch(self, outputs: Dict[str, List[torch.Tensor]], peak_kernel: int = 3) -> Dict[str, torch.Tensor]:
         box_logits = outputs["box_logits"]
         objectness_logits = outputs["objectness_logits"]
         class_embeddings = outputs["class_embeddings"]
@@ -92,6 +92,7 @@ class PromptDET(nn.Module):
         box_parts = []
         objectness_parts = []
         embedding_parts = []
+        peak_parts = []
         stride_parts = []
         flat_box_logits = []
         for box_logit, objectness_logit, class_embedding, stride in zip(
@@ -110,6 +111,14 @@ class PromptDET(nn.Module):
             flat_box_logits.append(box_logit)
             objectness_parts.append(objectness_logit.flatten(2).transpose(1, 2).squeeze(-1))
             embedding_parts.append(class_embedding.flatten(2).transpose(1, 2))
+            if peak_kernel > 1:
+                pad = peak_kernel // 2
+                peak_mask = F.max_pool2d(objectness_logit, kernel_size=peak_kernel, stride=1, padding=pad).eq(
+                    objectness_logit
+                )
+            else:
+                peak_mask = torch.ones_like(objectness_logit, dtype=torch.bool)
+            peak_parts.append(peak_mask.flatten(2).transpose(1, 2).squeeze(-1))
             stride_parts.append(torch.full((h * w, 1), stride, device=device))
 
         pred_dist = torch.cat(box_parts, dim=1)
@@ -133,15 +142,17 @@ class PromptDET(nn.Module):
             "stride_tensor": torch.cat(stride_parts, dim=0),
             "box_distribution": torch.cat(flat_box_logits, dim=1),
             "class_mask": class_mask,
+            "peak_mask": torch.cat(peak_parts, dim=1),
         }
 
     def decode_raw(
         self,
         outputs: Dict[str, Dict[str, List[torch.Tensor]]],
+        peak_kernel: int = 3,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         return {
-            "one2many": self._decode_branch(outputs["one2many"]),
-            "one2one": self._decode_branch(outputs["one2one"]),
+            "one2many": self._decode_branch(outputs["one2many"], peak_kernel=peak_kernel),
+            "one2one": self._decode_branch(outputs["one2one"], peak_kernel=peak_kernel),
         }
 
     @torch.no_grad()
@@ -155,18 +166,24 @@ class PromptDET(nn.Module):
         nms_iou_threshold: float = 0.5,
         pre_nms_topk: int = 256,
         one2one_topk: int = 300,
+        one2one_peak_kernel: int = 3,
         max_det: int = 100,
     ) -> List[Dict[str, torch.Tensor]]:
-        decoded = outputs if "one2one" in outputs and "pred_boxes" in outputs["one2one"] else self.decode_raw(outputs)
+        decoded = (
+            outputs
+            if "one2one" in outputs and "pred_boxes" in outputs["one2one"]
+            else self.decode_raw(outputs, peak_kernel=one2one_peak_kernel)
+        )
         branch = decoded["one2one"]
         pred_boxes = branch["pred_boxes"]
         pred_scores = branch["pred_scores"].sigmoid()
         pred_objectness = branch["pred_objectness"].sigmoid()
         decoded_class_mask = branch["class_mask"]
+        peak_masks = branch["peak_mask"]
 
         results = []
-        for batch_idx, (boxes, class_scores, class_ids, class_mask) in enumerate(
-            zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask)
+        for batch_idx, (boxes, class_scores, class_ids, class_mask, peak_mask) in enumerate(
+            zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask, peak_masks)
         ):
             padded_class_ids = torch.full(
                 (self.cfg.max_prompt_classes,),
@@ -192,6 +209,10 @@ class PromptDET(nn.Module):
 
             class_scores_max, class_index = valid_scores.max(dim=1)
             scores = torch.sqrt((class_scores_max * pred_objectness[batch_idx]).clamp(min=0.0))
+            keep = peak_mask
+            boxes = boxes[keep]
+            class_index = class_index[keep]
+            scores = scores[keep]
             if scores.numel() > pre_nms_topk:
                 topk_scores, topk_idx = torch.topk(scores, k=pre_nms_topk)
                 boxes = boxes[topk_idx]

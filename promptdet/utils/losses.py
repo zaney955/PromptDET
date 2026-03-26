@@ -18,6 +18,7 @@ class AssignmentResult:
     fg_mask: torch.Tensor
     matched_gt_indices: torch.Tensor
     matched_labels: torch.Tensor
+    duplicate_mask: torch.Tensor
 
 
 def sigmoid_varifocal_loss(
@@ -63,7 +64,14 @@ class PromptTaskAlignedAssigner:
         matched_labels = torch.full((num_points,), -1, dtype=torch.long, device=device)
 
         if gt_boxes.numel() == 0:
-            return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels)
+            return AssignmentResult(
+                target_scores,
+                target_boxes,
+                fg_mask,
+                matched_gt_indices,
+                matched_labels,
+                torch.zeros(num_points, dtype=torch.bool, device=device),
+            )
 
         assignment_metric = torch.full((num_points,), -1.0, device=device)
         overlaps = torch.zeros(num_points, device=device)
@@ -114,12 +122,26 @@ class PromptTaskAlignedAssigner:
         if fg_mask.any():
             target_boxes[fg_mask] = gt_boxes[matched_gt_indices[fg_mask]]
             target_scores[fg_mask, matched_labels[fg_mask]] = overlaps[fg_mask].clamp(min=0.1)
-        return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels)
+        return AssignmentResult(
+            target_scores,
+            target_boxes,
+            fg_mask,
+            matched_gt_indices,
+            matched_labels,
+            torch.zeros(num_points, dtype=torch.bool, device=device),
+        )
 
 
 class PromptOneToOneAssigner:
-    def __init__(self, center_sampling_radius: float = 0.75):
+    def __init__(
+        self,
+        center_sampling_radius: float = 0.75,
+        candidate_topk: int = 8,
+        duplicate_radius: float = 1.25,
+    ):
         self.center_sampling_radius = center_sampling_radius
+        self.candidate_topk = candidate_topk
+        self.duplicate_radius = duplicate_radius
 
     def assign(
         self,
@@ -138,11 +160,13 @@ class PromptOneToOneAssigner:
         fg_mask = torch.zeros(num_points, dtype=torch.bool, device=device)
         matched_gt_indices = torch.full((num_points,), -1, dtype=torch.long, device=device)
         matched_labels = torch.full((num_points,), -1, dtype=torch.long, device=device)
+        duplicate_mask = torch.zeros(num_points, dtype=torch.bool, device=device)
 
         if gt_boxes.numel() == 0:
-            return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels)
+            return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels, duplicate_mask)
 
         pred_obj = pred_objectness.sigmoid()
+        duplicate_candidates: Dict[int, torch.Tensor] = {}
         pair_candidates: List[tuple[float, int, int]] = []
         for gt_idx, gt_box in enumerate(gt_boxes):
             class_idx = int(gt_labels[gt_idx].item())
@@ -170,11 +194,13 @@ class PromptOneToOneAssigner:
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
             quality = torch.sqrt((pred_obj[candidate_inds] * cls_scores).clamp(min=0.0))
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
-            metric = quality * ious * center_prior
-            top_limit = min(candidate_inds.numel(), 32)
+            metric = quality * ious.pow(2) * center_prior.pow(2)
+            top_limit = min(candidate_inds.numel(), self.candidate_topk)
             top_metric, top_pos = torch.topk(metric, top_limit)
             for score, pos in zip(top_metric.tolist(), top_pos.tolist()):
                 pair_candidates.append((score, int(candidate_inds[pos].item()), gt_idx))
+            duplicate_center_mask = center_delta.max(dim=1).values <= self.duplicate_radius
+            duplicate_candidates[gt_idx] = torch.nonzero(inside & duplicate_center_mask, as_tuple=False).squeeze(1)
 
         pair_candidates.sort(key=lambda item: item[0], reverse=True)
         used_preds = set()
@@ -189,13 +215,17 @@ class PromptOneToOneAssigner:
             matched_gt_indices[pred_idx] = gt_idx
             matched_labels[pred_idx] = class_idx
             overlaps[pred_idx] = bbox_iou(pred_boxes[pred_idx].unsqueeze(0), gt_box.unsqueeze(0)).squeeze()
+            if gt_idx in duplicate_candidates:
+                duplicate_mask[duplicate_candidates[gt_idx]] = True
+                duplicate_mask[pred_idx] = False
             used_preds.add(pred_idx)
             used_gts.add(gt_idx)
 
         if fg_mask.any():
             target_boxes[fg_mask] = gt_boxes[matched_gt_indices[fg_mask]]
             target_scores[fg_mask, matched_labels[fg_mask]] = overlaps[fg_mask].clamp(min=0.1)
-        return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels)
+        duplicate_mask &= ~fg_mask
+        return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels, duplicate_mask)
 
 
 class DFLoss(torch.nn.Module):
@@ -223,7 +253,11 @@ class PromptDetectionLoss(torch.nn.Module):
             cfg.tal_beta,
             cfg.center_sampling_radius,
         )
-        self.one2one_assigner = PromptOneToOneAssigner(cfg.one2one_center_sampling_radius)
+        self.one2one_assigner = PromptOneToOneAssigner(
+            cfg.one2one_center_sampling_radius,
+            cfg.one2one_candidate_topk,
+            cfg.one2one_duplicate_radius,
+        )
         self.dfl = DFLoss(reg_max)
         self.cfg = cfg
 
@@ -313,6 +347,26 @@ class PromptDetectionLoss(torch.nn.Module):
                 tgt_dist = bbox2dist(anchor_points[assign.fg_mask], tgt_boxes, self.reg_max, stride_tensor[assign.fg_mask])
                 total_dfl = total_dfl + self.dfl(pos_logits.reshape(-1, self.reg_max), tgt_dist.reshape(-1)).mean()
                 total_pos += int(assign.fg_mask.sum().item())
+
+            if assign.duplicate_mask.any():
+                dup_logits = pred_objectness[batch_idx][assign.duplicate_mask]
+                dup_targets = torch.zeros_like(dup_logits)
+                total_objectness = total_objectness + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
+                    dup_logits,
+                    dup_targets,
+                    alpha=self.cfg.focal_alpha,
+                    gamma=self.cfg.focal_gamma,
+                    reduction="mean",
+                )
+                dup_scores = pred_scores[batch_idx][assign.duplicate_mask][:, valid_class_mask]
+                if dup_scores.numel() > 0:
+                    total_match = total_match + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
+                        dup_scores,
+                        torch.zeros_like(dup_scores),
+                        alpha=self.cfg.focal_alpha,
+                        gamma=self.cfg.focal_gamma,
+                        reduction="mean",
+                    )
 
             neg_mask = ~assign.fg_mask
             neg_count = int(neg_mask.sum().item())

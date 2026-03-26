@@ -56,6 +56,7 @@ class TrainConfig:
     nms_iou_threshold: float = 0.5
     pre_nms_topk: int = 256
     one2one_topk: int = 300
+    one2one_peak_kernel: int = 3
     max_det: int = 100
     eval_interval: int = 1
     save_interval: int = 1
@@ -69,10 +70,13 @@ class LossConfig:
     tal_beta: float = 6.0
     center_sampling_radius: float = 0.5
     one2one_center_sampling_radius: float = 0.75
+    one2one_candidate_topk: int = 8
+    one2one_duplicate_radius: float = 1.25
     objectness_weight: float = 1.0
     match_weight: float = 1.0
     iou_weight: float = 7.5
     dfl_weight: float = 1.5
+    duplicate_weight: float = 0.5
     contrast_weight: float = 0.0
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0

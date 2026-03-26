@@ -18,6 +18,7 @@ def evaluate(
     nms_iou_threshold: float,
     pre_nms_topk: int,
     one2one_topk: int,
+    one2one_peak_kernel: int,
     max_det: int,
 ) -> Dict[str, float]:
     model.eval()
@@ -51,6 +52,7 @@ def evaluate(
             nms_iou_threshold=nms_iou_threshold,
             pre_nms_topk=pre_nms_topk,
             one2one_topk=one2one_topk,
+            one2one_peak_kernel=one2one_peak_kernel,
             max_det=max_det,
         )
         for pred, target in zip(preds, batch["targets"]):

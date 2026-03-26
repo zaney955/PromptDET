@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--nms-iou-threshold", type=float, default=None)
     parser.add_argument("--pre-nms-topk", type=int, default=None)
     parser.add_argument("--one2one-topk", type=int, default=None)
+    parser.add_argument("--one2one-peak-kernel", type=int, default=None)
     parser.add_argument("--max-det", type=int, default=None)
     return parser.parse_args()
 
@@ -114,6 +115,8 @@ def main():
         config.train.pre_nms_topk = args.pre_nms_topk
     if args.one2one_topk is not None:
         config.train.one2one_topk = args.one2one_topk
+    if args.one2one_peak_kernel is not None:
+        config.train.one2one_peak_kernel = args.one2one_peak_kernel
     if args.max_det is not None:
         config.train.max_det = args.max_det
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
@@ -149,6 +152,7 @@ def main():
             nms_iou_threshold=config.train.nms_iou_threshold,
             pre_nms_topk=config.train.pre_nms_topk,
             one2one_topk=config.train.one2one_topk,
+            one2one_peak_kernel=config.train.one2one_peak_kernel,
             max_det=config.train.max_det,
         )[0]
 

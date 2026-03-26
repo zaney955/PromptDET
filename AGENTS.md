@@ -12,6 +12,9 @@
   - `one2one`: unique-matching branch for final inference.
 - Inference must use the `one2one` branch only.
 - Inference is NMS-free by design. Do not reintroduce NMS into the main prediction path unless explicitly requested for ablation.
+- Because the current `one2one` branch is still anchor-dense, NMS-free inference relies on two mechanisms that must be preserved together:
+  - unique assignment during training
+  - local peak filtering during inference
 - The score used at inference is a quality-aware combination of objectness and prompt-class confidence.
 
 ## Prompt Conditioning Rules
@@ -39,6 +42,7 @@
 - Background rejection should not rely only on threshold tuning.
 - Box regression should be supervised with quality-aware matching and center-aware assignment.
 - If duplicates reappear, fix assignment or one-to-one supervision first, not post-processing first.
+- The `one2one` branch should explicitly suppress non-matched neighbors around each matched target. Duplicate suppression belongs in supervision, not in NMS.
 - If class confusion persists, prefer improvements to:
   - prompt prototype quality
   - contrastive separation
@@ -48,6 +52,7 @@
 ## Inference Rules
 - The main inference path should be:
   - decode `one2one`
+  - apply local peak filtering
   - score
   - threshold
   - top-k
