@@ -121,6 +121,20 @@ python detect.py \
   --conf-threshold 0.15
 ```
 
+Batch directory mode:
+
+```bash
+python detect.py \
+  --config ./outputs/exp1/config.json \
+  --checkpoint ./outputs/exp1/best.pt \
+  --prompt-spec ./toy_data/prompt_set.json \
+  --query-image ./toy_data/images \
+  --output-dir ./outputs/infer_batch \
+  --conf-threshold 0.15
+```
+
+When `--query-image` points to a directory, each image is written to its own subdirectory under `--output-dir`, and a `batch_summary.json` file is also produced.
+
 `prompt_spec` format:
 
 ```json

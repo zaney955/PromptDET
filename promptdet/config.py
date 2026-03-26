@@ -57,6 +57,7 @@ class TrainConfig:
     pre_nms_topk: int = 256
     one2one_topk: int = 300
     one2one_peak_kernel: int = 3
+    class_margin_scale: float = 6.0
     max_det: int = 100
     eval_interval: int = 1
     save_interval: int = 1
@@ -80,7 +81,8 @@ class LossConfig:
     duplicate_weight: float = 0.5
     non_target_weight: float = 1.0
     confusable_non_target_weight: float = 2.0
-    contrast_weight: float = 0.0
+    non_target_logit_margin: float = 0.0
+    contrast_weight: float = 0.25
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     classification_margin: float = 0.2

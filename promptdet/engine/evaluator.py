@@ -19,6 +19,7 @@ def evaluate(
     pre_nms_topk: int,
     one2one_topk: int,
     one2one_peak_kernel: int,
+    class_margin_scale: float,
     max_det: int,
 ) -> Dict[str, float]:
     model.eval()
@@ -53,6 +54,7 @@ def evaluate(
             pre_nms_topk=pre_nms_topk,
             one2one_topk=one2one_topk,
             one2one_peak_kernel=one2one_peak_kernel,
+            class_margin_scale=class_margin_scale,
             max_det=max_det,
         )
         for pred, target in zip(preds, batch["targets"]):

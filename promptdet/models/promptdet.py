@@ -167,6 +167,7 @@ class PromptDET(nn.Module):
         pre_nms_topk: int = 256,
         one2one_topk: int = 300,
         one2one_peak_kernel: int = 3,
+        class_margin_scale: float = 6.0,
         max_det: int = 100,
     ) -> List[Dict[str, torch.Tensor]]:
         decoded = (
@@ -176,14 +177,15 @@ class PromptDET(nn.Module):
         )
         branch = decoded["one2one"]
         pred_boxes = branch["pred_boxes"]
-        pred_scores = branch["pred_scores"].sigmoid()
+        pred_logits = branch["pred_scores"]
+        pred_scores = pred_logits.sigmoid()
         pred_objectness = branch["pred_objectness"].sigmoid()
         decoded_class_mask = branch["class_mask"]
         peak_masks = branch["peak_mask"]
 
         results = []
-        for batch_idx, (boxes, class_scores, class_ids, class_mask, peak_mask) in enumerate(
-            zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask, peak_masks)
+        for batch_idx, (boxes, class_scores, class_logits, class_ids, class_mask, peak_mask) in enumerate(
+            zip(pred_boxes, pred_scores, pred_logits, prompt_class_ids, prompt_class_mask, peak_masks)
         ):
             padded_class_ids = torch.full(
                 (self.cfg.max_prompt_classes,),
@@ -199,6 +201,7 @@ class PromptDET(nn.Module):
 
             valid_class_ids = padded_class_ids[effective_mask]
             valid_scores = class_scores[:, effective_mask]
+            valid_logits = class_logits[:, effective_mask]
             if valid_scores.numel() == 0:
                 results.append({
                     "boxes": boxes.new_zeros((0, 4)),
@@ -208,7 +211,13 @@ class PromptDET(nn.Module):
                 continue
 
             class_scores_max, class_index = valid_scores.max(dim=1)
-            scores = torch.sqrt((class_scores_max * pred_objectness[batch_idx]).clamp(min=0.0))
+            if valid_logits.shape[1] > 1:
+                top2_logits = torch.topk(valid_logits, k=2, dim=1).values
+                margin_gate = torch.sigmoid((top2_logits[:, 0] - top2_logits[:, 1]) * class_margin_scale)
+            else:
+                margin_gate = torch.ones_like(class_scores_max)
+            class_confidence = class_scores_max * margin_gate
+            scores = torch.sqrt((class_confidence * pred_objectness[batch_idx]).clamp(min=0.0))
             keep = peak_mask
             boxes = boxes[keep]
             class_index = class_index[keep]
