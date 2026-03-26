@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--pre-nms-topk", type=int, default=None)
     parser.add_argument("--one2one-topk", type=int, default=None)
     parser.add_argument("--one2one-peak-kernel", type=int, default=None)
+    parser.add_argument("--class-margin-scale", type=float, default=None)
     parser.add_argument("--max-det", type=int, default=None)
     return parser.parse_args()
 
@@ -126,6 +127,7 @@ def _run_single_query(
     pre_nms_topk: int,
     one2one_topk: int,
     one2one_peak_kernel: int,
+    class_margin_scale: float,
     max_det: int,
 ) -> tuple[Image.Image, dict[str, torch.Tensor]]:
     query_pil = Image.open(query_path).convert("RGB")
@@ -153,6 +155,7 @@ def _run_single_query(
             pre_nms_topk=pre_nms_topk,
             one2one_topk=one2one_topk,
             one2one_peak_kernel=one2one_peak_kernel,
+            class_margin_scale=class_margin_scale,
             max_det=max_det,
         )[0]
 
@@ -178,6 +181,8 @@ def main():
         config.train.one2one_topk = args.one2one_topk
     if args.one2one_peak_kernel is not None:
         config.train.one2one_peak_kernel = args.one2one_peak_kernel
+    if args.class_margin_scale is not None:
+        config.train.class_margin_scale = args.class_margin_scale
     if args.max_det is not None:
         config.train.max_det = args.max_det
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
@@ -208,6 +213,7 @@ def main():
             pre_nms_topk=config.train.pre_nms_topk,
             one2one_topk=config.train.one2one_topk,
             one2one_peak_kernel=config.train.one2one_peak_kernel,
+            class_margin_scale=config.train.class_margin_scale,
             max_det=config.train.max_det,
         )
         payload = {

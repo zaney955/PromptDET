@@ -80,6 +80,12 @@ def build_box_region_weights(
     return weights
 
 
+def max_prompt_logit_margin_loss(logits: torch.Tensor, margin: float) -> torch.Tensor:
+    if logits.numel() == 0:
+        return logits.new_tensor(0.0)
+    return F.relu(logits.max(dim=-1).values - margin)
+
+
 class PromptTaskAlignedAssigner:
     def __init__(self, topk: int = 13, alpha: float = 1.0, beta: float = 6.0, center_sampling_radius: float = 0.5):
         self.topk = topk
@@ -326,6 +332,7 @@ class PromptDetectionLoss(torch.nn.Module):
         total_pos_score_sum = pred_scores.new_tensor(0.0)
         total_neg_score_sum = pred_scores.new_tensor(0.0)
         total_matched_iou_sum = pred_scores.new_tensor(0.0)
+        total_contrast = pred_scores.new_tensor(0.0)
         non_target_radius = getattr(assigner, "center_sampling_radius", self.cfg.non_target_center_sampling_radius)
 
         for batch_idx, target in enumerate(targets):
@@ -387,6 +394,19 @@ class PromptDetectionLoss(torch.nn.Module):
                     cls_logits = cls_logits.clone()
                     cls_logits[torch.arange(pos_labels.shape[0], device=pos_labels.device), pos_labels] -= self.cfg.classification_margin
                 total_match = total_match + 0.5 * F.cross_entropy(cls_logits, pos_labels, reduction="mean")
+                if valid_class_mask.sum() > 1:
+                    contrast_logits = pred_scores[batch_idx][assign.fg_mask][:, valid_class_mask]
+                    local_pos = pos_labels
+                    pos_contrast_logits = contrast_logits[
+                        torch.arange(local_pos.shape[0], device=local_pos.device),
+                        local_pos,
+                    ]
+                    neg_contrast_logits = contrast_logits.clone()
+                    neg_contrast_logits[torch.arange(local_pos.shape[0], device=local_pos.device), local_pos] = -1e4
+                    hardest_negative = neg_contrast_logits.max(dim=-1).values
+                    total_contrast = total_contrast + F.relu(
+                        self.cfg.classification_margin - (pos_contrast_logits - hardest_negative)
+                    ).mean()
 
                 pos_logits = box_logits[batch_idx][assign.fg_mask]
                 tgt_dist = bbox2dist(anchor_points[assign.fg_mask], tgt_boxes, self.reg_max, stride_tensor[assign.fg_mask])
@@ -412,6 +432,10 @@ class PromptDetectionLoss(torch.nn.Module):
                         gamma=self.cfg.focal_gamma,
                         reduction="mean",
                     )
+                    total_contrast = total_contrast + self.cfg.duplicate_weight * max_prompt_logit_margin_loss(
+                        dup_scores,
+                        margin=self.cfg.non_target_logit_margin,
+                    ).mean()
 
             prompt_region_weights = build_box_region_weights(
                 anchor_points,
@@ -449,6 +473,11 @@ class PromptDetectionLoss(torch.nn.Module):
                         reduction="none",
                     )
                     total_match = total_match + weighted_mean(non_target_match, region_weights)
+                    non_target_contrast = max_prompt_logit_margin_loss(
+                        non_target_scores,
+                        margin=self.cfg.non_target_logit_margin,
+                    )
+                    total_contrast = total_contrast + weighted_mean(non_target_contrast, region_weights)
 
             neg_mask = ~assign.fg_mask
             neg_count = int(neg_mask.sum().item())
@@ -465,6 +494,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_match": total_match / num_batches,
             "loss_iou": total_iou / num_batches,
             "loss_dfl": total_dfl / num_batches,
+            "loss_contrast": total_contrast / num_batches,
             "num_pos": pred_scores.new_tensor(float(total_pos)),
             "num_neg": pred_scores.new_tensor(float(total_neg)),
             "mean_pos_score": (total_pos_score_sum / max(total_pos, 1)).detach(),
@@ -485,12 +515,14 @@ class PromptDetectionLoss(torch.nn.Module):
             + self.cfg.match_weight * one2many["loss_match"]
             + self.cfg.iou_weight * one2many["loss_iou"]
             + self.cfg.dfl_weight * one2many["loss_dfl"]
+            + self.cfg.contrast_weight * one2many["loss_contrast"]
         )
         loss_one2one = (
             self.cfg.objectness_weight * one2one["loss_objectness"]
             + self.cfg.match_weight * one2one["loss_match"]
             + self.cfg.iou_weight * one2one["loss_iou"]
             + self.cfg.dfl_weight * one2one["loss_dfl"]
+            + self.cfg.contrast_weight * one2one["loss_contrast"]
         )
         total_loss = self.cfg.one2many_weight * loss_one2many + self.cfg.one2one_weight * loss_one2one
 
@@ -502,7 +534,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_match": one2one["loss_match"],
             "loss_iou": one2one["loss_iou"],
             "loss_dfl": one2one["loss_dfl"],
-            "loss_contrast": total_loss.new_tensor(0.0),
+            "loss_contrast": one2one["loss_contrast"],
             "num_pos": one2one["num_pos"],
             "num_neg": one2one["num_neg"],
             "mean_pos_score": one2one["mean_pos_score"],
