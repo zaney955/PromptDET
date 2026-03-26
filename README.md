@@ -82,7 +82,7 @@ python detect.py \
   --config ./outputs/exp1/config.json \
   --checkpoint ./outputs/exp1/best.pt \
   --prompt-image ./toy_data/images/train_00000.png \
-  --prompt-box 10 20 80 90 \
+  --prompt-box 62 57 125 120 \
   --prompt-label 0 \
   --query-image ./toy_data/images/val_00001.png \
   --output-dir ./outputs/infer_demo
@@ -94,7 +94,7 @@ Prompt-set mode:
 python detect.py \
   --config ./outputs/exp1/config.json \
   --checkpoint ./outputs/exp1/best.pt \
-  --prompt-spec ./examples/prompt_set.json \
+  --prompt-spec ./toy_data/prompt_set.json \
   --query-image ./toy_data/images/val_00001.png \
   --output-dir ./outputs/infer_prompt_set
 ```
@@ -105,20 +105,28 @@ python detect.py \
 {
   "prompts": [
     {
-      "image": "./toy_data/images/train_00000.png",
+      "image": "./images/train_00000.png",
       "annotations": [
-        {"bbox": [10, 20, 80, 90], "label": 0},
-        {"bbox": [100, 30, 150, 120], "label": 1}
+        {"bbox": [62, 57, 125, 120], "label": 0},
+        {"bbox": [173, 189, 214, 230], "label": 2}
       ]
     },
     {
-      "image": "./toy_data/images/train_00007.png",
+      "image": "./images/train_00007.png",
       "annotations": [
-        {"bbox": [35, 40, 95, 110], "label": 0}
+        {"bbox": [68, 87, 164, 183], "label": 1}
       ]
     }
   ]
 }
+```
+
+When `prompt_set.json` lives inside `toy_data/`, image paths are resolved relative to that JSON file. The `label` field is the dataset `category_id` from `train.json`, not a free-form class name.
+
+You can validate the generated toy dataset and prompt spec with:
+
+```bash
+python scripts/check_toy_data.py --data-dir ./toy_data
 ```
 
 Outputs:

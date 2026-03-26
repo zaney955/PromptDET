@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
-import math
 import random
 from pathlib import Path
 
@@ -76,6 +76,71 @@ def build_split(output_dir: Path, split: str, num_images: int, image_size: int):
         payload["images"].append({"id": image_id, "file_name": file_name, "width": image_size, "height": image_size})
 
     (output_dir / f"{split}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def build_prompt_spec(output_dir: Path, train_payload: dict):
+    image_by_id = {item["id"]: item for item in train_payload["images"]}
+    anns_by_image = defaultdict(list)
+    for ann in train_payload["annotations"]:
+        anns_by_image[ann["image_id"]].append(ann)
+
+    image_ids = sorted(anns_by_image.keys())
+    if not image_ids:
+        raise ValueError("train split has no annotations; cannot build prompt_set.json")
+
+    primary_image_id = image_ids[0]
+    for image_id in image_ids:
+        distinct_categories = {ann["category_id"] for ann in anns_by_image[image_id]}
+        if len(distinct_categories) >= 2:
+            primary_image_id = image_id
+            break
+
+    selected_annotations = []
+    selected_labels = []
+    seen_labels = set()
+    for ann in anns_by_image[primary_image_id]:
+        if ann["category_id"] in seen_labels:
+            continue
+        selected_annotations.append({
+            "bbox": ann["bbox"],
+            "label": ann["category_id"],
+        })
+        selected_labels.append(ann["category_id"])
+        seen_labels.add(ann["category_id"])
+        if len(selected_annotations) >= 2:
+            break
+
+    prompts = [{
+        "image": f"./images/{image_by_id[primary_image_id]['file_name']}",
+        "annotations": selected_annotations,
+    }]
+
+    for label in selected_labels:
+        found = None
+        for image_id in image_ids:
+            if image_id == primary_image_id:
+                continue
+            match = next((ann for ann in anns_by_image[image_id] if ann["category_id"] == label), None)
+            if match is not None:
+                found = {
+                    "image": f"./images/{image_by_id[image_id]['file_name']}",
+                    "annotations": [{
+                        "bbox": match["bbox"],
+                        "label": match["category_id"],
+                    }],
+                }
+                break
+        if found is not None:
+            prompts.append(found)
+            break
+
+    prompt_payload = {"prompts": prompts}
+    (output_dir / "prompt_set.json").write_text(
+        json.dumps(prompt_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return prompt_payload
 
 
 def parse_args():
@@ -93,8 +158,9 @@ def main():
     random.seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    build_split(output_dir, "train", args.train_images, args.image_size)
+    train_payload = build_split(output_dir, "train", args.train_images, args.image_size)
     build_split(output_dir, "val", args.val_images, args.image_size)
+    build_prompt_spec(output_dir, train_payload)
     print(f"Toy dataset generated at {output_dir}")
 
 

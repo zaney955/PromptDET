@@ -41,9 +41,11 @@ def parse_args():
 
 def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
     if args.prompt_spec:
-        payload = json.loads(Path(args.prompt_spec).read_text(encoding="utf-8"))
+        prompt_spec_path = Path(args.prompt_spec).resolve()
+        payload = json.loads(prompt_spec_path.read_text(encoding="utf-8"))
         prompts = payload["prompts"]
     else:
+        prompt_spec_path = None
         if args.prompt_image is None or args.prompt_box is None or args.prompt_label is None:
             raise ValueError("Single prompt mode requires --prompt-image, --prompt-box and --prompt-label.")
         prompts = [{
@@ -57,7 +59,10 @@ def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
     label_to_slot = {}
 
     for prompt in prompts:
-        prompt_image = Image.open(prompt["image"]).convert("RGB")
+        prompt_image_path = Path(prompt["image"])
+        if not prompt_image_path.is_absolute() and prompt_spec_path is not None:
+            prompt_image_path = (prompt_spec_path.parent / prompt_image_path).resolve()
+        prompt_image = Image.open(prompt_image_path).convert("RGB")
         resized = resize_image(prompt_image, image_size)
         scale_x = image_size / prompt_image.size[0]
         scale_y = image_size / prompt_image.size[1]
