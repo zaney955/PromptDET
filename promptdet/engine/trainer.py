@@ -67,6 +67,7 @@ def train(
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.train.epochs}", leave=False)
         epoch_stats = {
             "loss": 0.0,
+            "loss_objectness": 0.0,
             "loss_match": 0.0,
             "loss_iou": 0.0,
             "loss_dfl": 0.0,
@@ -120,6 +121,7 @@ def train(
             num_steps += 1
             pbar.set_postfix(
                 loss=f"{float(loss.item()):.4f}",
+                obj=f"{float(losses['loss_objectness'].item()):.4f}",
                 pos=f"{float(losses['num_pos'].item()):.1f}",
                 ps=f"{float(losses['mean_pos_score'].item()):.3f}",
                 ns=f"{float(losses['mean_neg_score'].item()):.3f}",

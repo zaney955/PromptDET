@@ -105,6 +105,25 @@ class DFLoss(torch.nn.Module):
         return loss_left * weight_left + loss_right * weight_right
 
 
+def sigmoid_focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+    gamma: float,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    prob = logits.sigmoid()
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    alpha_factor = alpha * targets + (1 - alpha) * (1 - targets)
+    loss = ce * alpha_factor * (1 - p_t).pow(gamma)
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "mean":
+        return loss.mean()
+    return loss
+
+
 class PromptDetectionLoss(torch.nn.Module):
     def __init__(self, reg_max: int, cfg: LossConfig):
         super().__init__()
@@ -120,11 +139,13 @@ class PromptDetectionLoss(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         pred_boxes = outputs["pred_boxes"]
         pred_scores = outputs["pred_scores"]
+        pred_objectness = outputs["pred_objectness"]
         anchor_points = outputs["anchor_points"]
         stride_tensor = outputs["stride_tensor"]
         box_logits = outputs["box_distribution"]
         class_mask = outputs["class_mask"]
 
+        total_objectness = pred_scores.new_tensor(0.0)
         total_match = pred_scores.new_tensor(0.0)
         total_iou = pred_scores.new_tensor(0.0)
         total_dfl = pred_scores.new_tensor(0.0)
@@ -148,12 +169,17 @@ class PromptDetectionLoss(torch.nn.Module):
                 valid_class_mask,
             )
 
-            valid_logits = pred_scores[batch_idx][:, valid_class_mask]
-            valid_targets = assign.target_scores[:, valid_class_mask]
-            match_loss = F.binary_cross_entropy_with_logits(valid_logits, valid_targets, reduction="mean")
-            total_match = total_match + match_loss
+            objectness_target = assign.fg_mask.float()
+            total_objectness = total_objectness + sigmoid_focal_loss(
+                pred_objectness[batch_idx],
+                objectness_target,
+                alpha=self.cfg.focal_alpha,
+                gamma=self.cfg.focal_gamma,
+                reduction="mean",
+            )
 
             pred_prob = pred_scores[batch_idx].sigmoid()
+            pred_obj = pred_objectness[batch_idx].sigmoid()
             if assign.fg_mask.any():
                 pos_boxes = pred_boxes[batch_idx][assign.fg_mask]
                 tgt_boxes = assign.target_boxes[assign.fg_mask]
@@ -162,7 +188,12 @@ class PromptDetectionLoss(torch.nn.Module):
                 total_matched_iou_sum = total_matched_iou_sum + bbox_iou(pos_boxes, tgt_boxes).sum()
 
                 pos_labels = assign.matched_labels[assign.fg_mask]
-                total_pos_score_sum = total_pos_score_sum + pred_prob[assign.fg_mask, pos_labels].sum()
+                pos_joint_scores = pred_obj[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]
+                total_pos_score_sum = total_pos_score_sum + pos_joint_scores.sum()
+
+                cls_logits = pred_scores[batch_idx][assign.fg_mask]
+                cls_logits = cls_logits.masked_fill(~valid_class_mask.unsqueeze(0), -1e4)
+                total_match = total_match + F.cross_entropy(cls_logits, pos_labels, reduction="mean")
 
                 pos_logits = box_logits[batch_idx][assign.fg_mask]
                 tgt_dist = bbox2dist(anchor_points[assign.fg_mask], tgt_boxes, self.reg_max, stride_tensor[assign.fg_mask])
@@ -179,20 +210,23 @@ class PromptDetectionLoss(torch.nn.Module):
                 total_neg += neg_count
                 neg_scores = pred_prob[neg_mask][:, valid_class_mask]
                 if neg_scores.numel() > 0:
-                    total_neg_score_sum = total_neg_score_sum + neg_scores.max(dim=-1).values.sum()
+                    neg_joint_scores = pred_obj[neg_mask] * neg_scores.max(dim=-1).values
+                    total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
 
         num_batches = max(len(targets), 1)
         mean_pos_score = total_pos_score_sum / max(total_pos, 1)
         mean_neg_score = total_neg_score_sum / max(total_neg, 1)
         mean_matched_iou = total_matched_iou_sum / max(total_pos, 1)
         total_loss = (
-            self.cfg.match_weight * total_match
+            self.cfg.objectness_weight * total_objectness
+            + self.cfg.match_weight * total_match
             + self.cfg.iou_weight * total_iou
             + self.cfg.dfl_weight * total_dfl
             + self.cfg.contrast_weight * total_contrast
         ) / num_batches
         return {
             "loss": total_loss,
+            "loss_objectness": total_objectness / num_batches,
             "loss_match": total_match / num_batches,
             "loss_iou": total_iou / num_batches,
             "loss_dfl": total_dfl / num_batches,

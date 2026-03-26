@@ -73,6 +73,7 @@ class PromptDET(nn.Module):
         outputs: Dict[str, List[torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
         box_logits = outputs["box_logits"]
+        objectness_logits = outputs["objectness_logits"]
         class_embeddings = outputs["class_embeddings"]
         class_prototypes = outputs["class_prototypes"]
         class_mask = outputs["class_mask"]
@@ -83,20 +84,28 @@ class PromptDET(nn.Module):
         anchor_points, _ = make_anchors(feature_shapes, outputs["strides"], device=device)
 
         box_parts = []
+        objectness_parts = []
         embedding_parts = []
         stride_parts = []
         flat_box_logits = []
-        for box_logit, class_embedding, stride in zip(box_logits, class_embeddings, outputs["strides"]):
+        for box_logit, objectness_logit, class_embedding, stride in zip(
+            box_logits,
+            objectness_logits,
+            class_embeddings,
+            outputs["strides"],
+        ):
             b, _, h, w = box_logit.shape
             box_logit = box_logit.view(b, 4, self.cfg.reg_max, h, w).permute(0, 3, 4, 1, 2).reshape(b, h * w, 4, self.cfg.reg_max)
             probs = box_logit.softmax(dim=-1)
             dist = (probs * self.proj_bins.to(device)).sum(dim=-1) * stride
             box_parts.append(dist)
             flat_box_logits.append(box_logit)
+            objectness_parts.append(objectness_logit.flatten(2).transpose(1, 2).squeeze(-1))
             embedding_parts.append(class_embedding.flatten(2).transpose(1, 2))
             stride_parts.append(torch.full((h * w, 1), stride, device=device))
 
         pred_dist = torch.cat(box_parts, dim=1)
+        pred_objectness = torch.cat(objectness_parts, dim=1)
         query_embeddings = torch.cat(embedding_parts, dim=1)
         pred_boxes = []
         for batch_idx in range(batch):
@@ -111,6 +120,7 @@ class PromptDET(nn.Module):
         return {
             "pred_boxes": pred_boxes,
             "pred_scores": pred_scores,
+            "pred_objectness": pred_objectness,
             "anchor_points": anchor_points,
             "stride_tensor": torch.cat(stride_parts, dim=0),
             "box_distribution": torch.cat(flat_box_logits, dim=1),
@@ -131,6 +141,7 @@ class PromptDET(nn.Module):
         decoded = self.decode_raw(outputs)
         pred_boxes = decoded["pred_boxes"]
         pred_scores = decoded["pred_scores"].sigmoid()
+        pred_objectness = decoded["pred_objectness"].sigmoid()
         decoded_class_mask = decoded["class_mask"]
         results = []
         for batch_idx, (boxes, class_scores, class_ids, class_mask) in enumerate(zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask)):
@@ -155,7 +166,8 @@ class PromptDET(nn.Module):
                     "labels": class_ids.new_zeros((0,)),
                 })
                 continue
-            scores, class_index = valid_scores.max(dim=1)
+            class_scores_max, class_index = valid_scores.max(dim=1)
+            scores = class_scores_max * pred_objectness[batch_idx]
             keep = scores > conf_threshold
             boxes = clamp_boxes(boxes[keep], image_size, image_size)
             scores = scores[keep]

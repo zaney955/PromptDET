@@ -31,8 +31,8 @@ class DataConfig:
     max_prompt_classes: int = 3
     max_prompt_instances_per_class: int = 2
     max_prompt_images: int = 4
-    negative_ratio: float = 0.25
-    hard_negative_ratio: float = 0.25
+    negative_ratio: float = 0.35
+    hard_negative_ratio: float = 0.35
     episodes_per_epoch: int = 2000
     val_episodes: int = 300
     num_workers: int = 2
@@ -60,13 +60,16 @@ class TrainConfig:
 
 @dataclass
 class LossConfig:
-    tal_topk: int = 13
+    tal_topk: int = 9
     tal_alpha: float = 1.0
     tal_beta: float = 6.0
+    objectness_weight: float = 1.0
     match_weight: float = 1.0
     iou_weight: float = 7.5
     dfl_weight: float = 1.5
     contrast_weight: float = 0.0
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
 
 
 @dataclass
