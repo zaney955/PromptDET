@@ -46,7 +46,10 @@ class PromptDET(nn.Module):
         prompt_type: torch.Tensor,
     ) -> Dict[str, List[torch.Tensor]]:
         batch_size, num_instances = prompt_images.shape[:2]
-        flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:])
+        flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous(
+            memory_format=torch.channels_last
+        )
+        query_image = query_image.contiguous(memory_format=torch.channels_last)
         flat_prompt_feats = self.neck(self.backbone(flat_prompt_images))
         prompt_feats = {
             name: feat.view(batch_size, num_instances, *feat.shape[1:])
@@ -66,6 +69,7 @@ class PromptDET(nn.Module):
         outputs = self.head(fused)
         outputs["class_prototypes"] = prompt["class_prototypes"]
         outputs["class_mask"] = prompt["class_mask"]
+        outputs["logit_scale"] = self.logit_scale.exp()
         return outputs
 
     def decode_raw(
@@ -77,6 +81,7 @@ class PromptDET(nn.Module):
         class_embeddings = outputs["class_embeddings"]
         class_prototypes = outputs["class_prototypes"]
         class_mask = outputs["class_mask"]
+        logit_scale = outputs["logit_scale"]
 
         batch = box_logits[0].shape[0]
         device = box_logits[0].device
@@ -114,7 +119,7 @@ class PromptDET(nn.Module):
 
         query_embeddings = F.normalize(query_embeddings, dim=-1)
         class_prototypes = F.normalize(class_prototypes, dim=-1)
-        pred_scores = torch.einsum("bnd,bkd->bnk", query_embeddings, class_prototypes) * self.logit_scale.exp()
+        pred_scores = torch.einsum("bnd,bkd->bnk", query_embeddings, class_prototypes) * logit_scale
         pred_scores = pred_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
 
         return {

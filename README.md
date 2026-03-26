@@ -53,6 +53,18 @@ This creates:
 python train.py --config configs/toy_train.json --device cpu
 ```
 
+Single-node multi-GPU training with DDP:
+
+```bash
+torchrun --nproc_per_node=4 train.py --config configs/toy_train.json --device cuda
+```
+
+To suppress the `OMP_NUM_THREADS` warning from `torchrun`, set it explicitly:
+
+```bash
+OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 train.py --config configs/toy_train.json --device cuda
+```
+
 You can override any important path from the CLI:
 
 ```bash
@@ -64,6 +76,8 @@ python train.py \
   --output-dir ./outputs/exp1 \
   --device cuda
 ```
+
+The `batch_size` argument is the per-process batch size. For example, `torchrun --nproc_per_node=4 ... --batch-size 8` gives an effective global batch size of `32`.
 
 Sampling behavior is controlled in `configs/toy_train.json`:
 

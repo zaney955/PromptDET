@@ -169,6 +169,8 @@ class PromptDetectionLoss(torch.nn.Module):
                 valid_class_mask,
             )
 
+            total_match = total_match + pred_scores[batch_idx][:, valid_class_mask].sum() * 0.0
+            total_dfl = total_dfl + box_logits[batch_idx].sum() * 0.0
             objectness_target = assign.fg_mask.float()
             total_objectness = total_objectness + sigmoid_focal_loss(
                 pred_objectness[batch_idx],

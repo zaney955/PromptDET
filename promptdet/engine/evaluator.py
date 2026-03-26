@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from promptdet.utils.metrics import aggregate_metrics, match_detections
+from promptdet.utils.misc import reduce_tensor, unwrap_model
 
 
 @torch.no_grad()
@@ -18,6 +19,7 @@ def evaluate(
     max_det: int,
 ) -> Dict[str, float]:
     model.eval()
+    model_without_ddp = unwrap_model(model)
     items = []
     for batch in dataloader:
         prompt_images = batch["prompt_images"].to(device)
@@ -38,7 +40,7 @@ def evaluate(
             query_image,
             prompt_type,
         )
-        preds = model.predict(
+        preds = model_without_ddp.predict(
             raw,
             prompt_class_ids,
             prompt_class_mask,
@@ -59,11 +61,21 @@ def evaluate(
             )
 
     metrics = aggregate_metrics(items)
+    metric_tensor = torch.tensor(
+        [metrics.tp, metrics.fp, metrics.fn],
+        dtype=torch.float32,
+        device=device,
+    )
+    metric_tensor = reduce_tensor(metric_tensor, average=False)
+    tp, fp, fn = [float(x) for x in metric_tensor.tolist()]
+    precision = tp / max(tp + fp, 1.0)
+    recall = tp / max(tp + fn, 1.0)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-6)
     return {
-        "precision": metrics.precision,
-        "recall": metrics.recall,
-        "f1": metrics.f1,
-        "tp": float(metrics.tp),
-        "fp": float(metrics.fp),
-        "fn": float(metrics.fn),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
     }

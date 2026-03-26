@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Dict
 
 import torch
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from promptdet.config import PromptDetConfig
 from promptdet.engine.evaluator import evaluate
 from promptdet.utils.checkpoint import load_checkpoint, save_checkpoint
-from promptdet.utils.misc import save_json
+from promptdet.utils.misc import is_main_process, reduce_dict, save_json, unwrap_model
 
 
 def _make_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, warmup_epochs: int):
@@ -50,6 +51,7 @@ def train(
 
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
     model.to(device)
+    model_without_ddp = unwrap_model(model)
     loss_fn.to(device)
     scaler = torch.amp.GradScaler("cuda", enabled=config.train.mixed_precision and device.type == "cuda")
     scheduler = _make_scheduler(optimizer, config.train.epochs, config.train.warmup_epochs)
@@ -57,14 +59,16 @@ def train(
     best_f1 = 0.0
 
     if config.train.resume:
-        checkpoint = load_checkpoint(config.train.resume, model, optimizer=optimizer, scheduler=scheduler, map_location=device.type)
+        checkpoint = load_checkpoint(config.train.resume, model_without_ddp, optimizer=optimizer, scheduler=scheduler, map_location=device.type)
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_f1 = float(checkpoint.get("best_score", 0.0))
 
     history = []
     for epoch in range(start_epoch, config.train.epochs):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.train.epochs}", leave=False)
+        if isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.train.epochs}", leave=False, disable=not is_main_process())
         epoch_stats = {
             "loss": 0.0,
             "loss_objectness": 0.0,
@@ -105,7 +109,7 @@ def train(
                     query_image,
                     prompt_type,
                 )
-                decoded = model.decode_raw(raw)
+                decoded = model_without_ddp.decode_raw(raw)
                 losses = loss_fn(decoded, targets)
                 loss = losses["loss"]
 
@@ -128,7 +132,9 @@ def train(
             )
 
         scheduler.step()
-        train_metrics = {key: value / max(num_steps, 1) for key, value in epoch_stats.items()}
+        reduced_epoch_stats = reduce_dict(epoch_stats, average=False)
+        total_steps = reduce_dict({"num_steps": float(num_steps)}, average=False)["num_steps"]
+        train_metrics = {key: value / max(total_steps, 1.0) for key, value in reduced_epoch_stats.items()}
         summary = {"epoch": epoch, **train_metrics}
 
         if (epoch + 1) % config.train.eval_interval == 0:
@@ -141,13 +147,15 @@ def train(
                 max_det=config.train.max_det,
             )
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})
-            if val_metrics["f1"] >= best_f1:
+            if val_metrics["f1"] >= best_f1 and is_main_process():
                 best_f1 = val_metrics["f1"]
-                save_checkpoint(output_dir / "best.pt", model, optimizer, scheduler, epoch=epoch, best_score=best_f1, extra=summary)
+                save_checkpoint(output_dir / "best.pt", model_without_ddp, optimizer, scheduler, epoch=epoch, best_score=best_f1, extra=summary)
+            best_f1 = max(best_f1, val_metrics["f1"])
 
-        history.append(summary)
-        if (epoch + 1) % config.train.save_interval == 0:
-            save_checkpoint(output_dir / "last.pt", model, optimizer, scheduler, epoch=epoch, best_score=best_f1, extra=summary)
-        save_json(output_dir / "history.json", {"history": history, "best_f1": best_f1})
+        if is_main_process():
+            history.append(summary)
+            if (epoch + 1) % config.train.save_interval == 0:
+                save_checkpoint(output_dir / "last.pt", model_without_ddp, optimizer, scheduler, epoch=epoch, best_score=best_f1, extra=summary)
+            save_json(output_dir / "history.json", {"history": history, "best_f1": best_f1})
 
     return {"best_f1": best_f1}

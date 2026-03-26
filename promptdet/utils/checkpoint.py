@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from promptdet.utils.misc import unwrap_model
+
 
 def save_checkpoint(
     path: str | Path,
@@ -15,8 +17,9 @@ def save_checkpoint(
     best_score: float = 0.0,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
+    model_to_save = unwrap_model(model)
     payload = {
-        "model": model.state_dict(),
+        "model": model_to_save.state_dict(),
         "epoch": epoch,
         "best_score": best_score,
     }
@@ -39,7 +42,7 @@ def load_checkpoint(
     map_location: str = "cpu",
 ) -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=map_location)
-    model.load_state_dict(checkpoint["model"])
+    unwrap_model(model).load_state_dict(checkpoint["model"])
     if optimizer is not None and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and "scheduler" in checkpoint:

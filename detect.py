@@ -104,12 +104,16 @@ def main():
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
 
     model = PromptDET(config.model).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     load_checkpoint(args.checkpoint, model, map_location=device.type)
     model.eval()
 
     prompt_batch = _load_prompt_set(args, config.model.image_size, config.model.max_prompt_classes)
     query_pil = Image.open(args.query_image).convert("RGB")
     query_tensor = resize_image(query_pil, config.model.image_size).unsqueeze(0).to(device)
+    if device.type == "cuda":
+        query_tensor = query_tensor.contiguous(memory_format=torch.channels_last)
 
     with torch.no_grad():
         raw = model(
