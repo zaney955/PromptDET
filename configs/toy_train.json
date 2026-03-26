@@ -1,0 +1,50 @@
+{
+  "model": {
+    "image_size": 256,
+    "num_classes": 8,
+    "backbone_widths": [48, 96, 192, 384],
+    "neck_channels": 192,
+    "prompt_dim": 256,
+    "reg_max": 16,
+    "num_attention_heads": 8,
+    "prompt_crop_size": 128,
+    "label_dropout": 0.4
+  },
+  "data": {
+    "train_annotations": "./toy_data/train.json",
+    "val_annotations": "./toy_data/val.json",
+    "images_dir": "./toy_data/images",
+    "negative_ratio": 0.25,
+    "hard_negative_ratio": 0.25,
+    "episodes_per_epoch": 1000,
+    "val_episodes": 200,
+    "num_workers": 2
+  },
+  "train": {
+    "output_dir": "./outputs/toy_run",
+    "batch_size": 8,
+    "epochs": 20,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "warmup_epochs": 2,
+    "device": "cuda",
+    "seed": 42,
+    "mixed_precision": true,
+    "grad_clip": 5.0,
+    "conf_threshold": 0.25,
+    "nms_iou_threshold": 0.5,
+    "max_det": 100,
+    "eval_interval": 1,
+    "save_interval": 1,
+    "resume": ""
+  },
+  "loss": {
+    "tal_topk": 13,
+    "tal_alpha": 1.0,
+    "tal_beta": 6.0,
+    "match_weight": 1.0,
+    "iou_weight": 7.5,
+    "dfl_weight": 1.5,
+    "contrast_weight": 0.0
+  }
+}
