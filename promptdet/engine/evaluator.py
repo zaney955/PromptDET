@@ -20,16 +20,43 @@ def evaluate(
     model.eval()
     items = []
     for batch in dataloader:
-        support_image = batch["support_image"].to(device)
-        support_box = batch["support_box"].to(device)
-        prompt_label = batch["prompt_label"].to(device)
+        prompt_images = batch["prompt_images"].to(device)
+        prompt_boxes = batch["prompt_boxes"].to(device)
+        prompt_class_indices = batch["prompt_class_indices"].to(device)
+        prompt_instance_mask = batch["prompt_instance_mask"].to(device)
+        prompt_class_ids = batch["prompt_class_ids"].to(device)
+        prompt_class_mask = batch["prompt_class_mask"].to(device)
         prompt_type = batch["prompt_type"].to(device)
         query_image = batch["query_image"].to(device)
 
-        raw = model(support_image, support_box, prompt_label, query_image, prompt_type)
-        preds = model.predict(raw, prompt_label, image_size=query_image.shape[-1], conf_threshold=conf_threshold, nms_iou_threshold=nms_iou_threshold, max_det=max_det)
+        raw = model(
+            prompt_images,
+            prompt_boxes,
+            prompt_class_indices,
+            prompt_instance_mask,
+            prompt_class_mask,
+            query_image,
+            prompt_type,
+        )
+        preds = model.predict(
+            raw,
+            prompt_class_ids,
+            prompt_class_mask,
+            image_size=query_image.shape[-1],
+            conf_threshold=conf_threshold,
+            nms_iou_threshold=nms_iou_threshold,
+            max_det=max_det,
+        )
         for pred, target in zip(preds, batch["targets"]):
-            items.append(match_detections(pred["boxes"].cpu(), pred["scores"].cpu(), target["boxes"].cpu()))
+            items.append(
+                match_detections(
+                    pred["boxes"].cpu(),
+                    pred["scores"].cpu(),
+                    pred["labels"].cpu(),
+                    target["boxes"].cpu(),
+                    target["category_ids"].cpu(),
+                )
+            )
 
     metrics = aggregate_metrics(items)
     return {

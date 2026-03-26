@@ -31,6 +31,7 @@ def _move_targets(targets, device: torch.device):
         moved.append({
             "boxes": target["boxes"].to(device),
             "labels": target["labels"].to(device),
+            "category_ids": target["category_ids"].to(device),
             "image_size": target["image_size"],
         })
     return moved
@@ -78,9 +79,11 @@ def train(
         }
         num_steps = 0
         for batch in pbar:
-            support_image = batch["support_image"].to(device)
-            support_box = batch["support_box"].to(device)
-            prompt_label = batch["prompt_label"].to(device)
+            prompt_images = batch["prompt_images"].to(device)
+            prompt_boxes = batch["prompt_boxes"].to(device)
+            prompt_class_indices = batch["prompt_class_indices"].to(device)
+            prompt_instance_mask = batch["prompt_instance_mask"].to(device)
+            prompt_class_mask = batch["prompt_class_mask"].to(device)
             prompt_type = batch["prompt_type"].to(device)
             query_image = batch["query_image"].to(device)
             targets = _move_targets(batch["targets"], device)
@@ -92,7 +95,15 @@ def train(
                 else nullcontext()
             )
             with amp_context:
-                raw = model(support_image, support_box, prompt_label, query_image, prompt_type)
+                raw = model(
+                    prompt_images,
+                    prompt_boxes,
+                    prompt_class_indices,
+                    prompt_instance_mask,
+                    prompt_class_mask,
+                    query_image,
+                    prompt_type,
+                )
                 decoded = model.decode_raw(raw)
                 losses = loss_fn(decoded, targets)
                 loss = losses["loss"]

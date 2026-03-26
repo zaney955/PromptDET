@@ -21,7 +21,9 @@ class DetectionMetrics:
 def match_detections(
     pred_boxes: torch.Tensor,
     pred_scores: torch.Tensor,
+    pred_labels: torch.Tensor,
     gt_boxes: torch.Tensor,
+    gt_labels: torch.Tensor,
     iou_threshold: float = 0.5,
 ) -> DetectionMetrics:
     if pred_boxes.numel() == 0 and gt_boxes.numel() == 0:
@@ -38,8 +40,14 @@ def match_detections(
     tp = 0
     fp = 0
     for pred_idx in range(pred_boxes.shape[0]):
-        gt_idx = torch.argmax(ious[pred_idx])
-        best_iou = ious[pred_idx, gt_idx]
+        same_label = gt_labels == pred_labels[pred_idx]
+        if not same_label.any():
+            fp += 1
+            continue
+        candidate_ious = ious[pred_idx].clone()
+        candidate_ious[~same_label] = -1
+        gt_idx = torch.argmax(candidate_ious)
+        best_iou = candidate_ious[gt_idx]
         if best_iou >= iou_threshold and not matched_gt[gt_idx]:
             matched_gt[gt_idx] = True
             tp += 1

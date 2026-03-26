@@ -47,6 +47,8 @@ def main():
 
     if not config.data.train_annotations or not config.data.val_annotations or not config.data.images_dir:
         raise ValueError("train/val annotations and images_dir must be provided.")
+    if config.data.max_prompt_classes > config.model.max_prompt_classes:
+        raise ValueError("data.max_prompt_classes cannot exceed model.max_prompt_classes.")
 
     set_seed(config.train.seed)
     output_dir = Path(config.train.output_dir)
@@ -60,6 +62,10 @@ def main():
         episodes_per_epoch=config.data.episodes_per_epoch,
         negative_ratio=config.data.negative_ratio,
         hard_negative_ratio=config.data.hard_negative_ratio,
+        min_prompt_classes=config.data.min_prompt_classes,
+        max_prompt_classes=config.data.max_prompt_classes,
+        max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
+        max_prompt_images=config.data.max_prompt_images,
     )
     val_dataset = PromptEpisodeDataset(
         annotations_path=config.data.val_annotations,
@@ -68,6 +74,10 @@ def main():
         episodes_per_epoch=config.data.val_episodes,
         negative_ratio=config.data.negative_ratio,
         hard_negative_ratio=config.data.hard_negative_ratio,
+        min_prompt_classes=config.data.min_prompt_classes,
+        max_prompt_classes=config.data.max_prompt_classes,
+        max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
+        max_prompt_images=config.data.max_prompt_images,
     )
     model = PromptDET(config.model)
     loss_fn = PromptDetectionLoss(config.model.reg_max, config.loss)

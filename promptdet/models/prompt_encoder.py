@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
@@ -10,7 +10,7 @@ from .common import ConvBNAct, MLP
 
 
 def crop_and_resize(images: torch.Tensor, boxes: torch.Tensor, size: int) -> torch.Tensor:
-    crops: List[torch.Tensor] = []
+    crops = []
     _, _, height, width = images.shape
     for image, box in zip(images, boxes):
         x1, y1, x2, y2 = box.round().long().tolist()
@@ -24,20 +24,30 @@ def crop_and_resize(images: torch.Tensor, boxes: torch.Tensor, size: int) -> tor
     return torch.stack(crops, dim=0)
 
 
+def masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+    weights = mask.float()
+    while weights.dim() < values.dim():
+        weights = weights.unsqueeze(-1)
+    denom = weights.sum(dim=dim, keepdim=False).clamp(min=1.0)
+    summed = (values * weights).sum(dim=dim, keepdim=False)
+    return summed / denom
+
+
 class PromptEncoder(nn.Module):
     def __init__(
         self,
-        num_classes: int,
         prompt_dim: int,
         out_channels: int,
         crop_size: int,
         prompt_types: list[str],
         label_dropout: float,
+        max_prompt_classes: int,
     ):
         super().__init__()
         self.prompt_dim = prompt_dim
         self.crop_size = crop_size
         self.label_dropout = label_dropout
+        self.max_prompt_classes = max_prompt_classes
         self.prompt_types = {name: idx for idx, name in enumerate(prompt_types)}
 
         self.crop_encoder = nn.Sequential(
@@ -48,7 +58,8 @@ class PromptEncoder(nn.Module):
         )
         self.local_proj = nn.Conv2d(out_channels, out_channels, 1)
         self.global_proj = nn.Linear(out_channels * 2 + 4, prompt_dim)
-        self.label_embed = nn.Embedding(num_classes + 1, prompt_dim)
+        self.class_slot_embed = nn.Embedding(max_prompt_classes, prompt_dim)
+        self.local_slot_proj = nn.Linear(prompt_dim, out_channels)
         self.type_embed = nn.Embedding(len(prompt_types), prompt_dim)
         self.scale_proj = nn.ModuleDict({
             "p3": nn.Linear(prompt_dim, out_channels),
@@ -59,34 +70,87 @@ class PromptEncoder(nn.Module):
 
     def forward(
         self,
-        support_image: torch.Tensor,
-        support_box: torch.Tensor,
-        support_feats: Dict[str, torch.Tensor],
-        prompt_label: torch.Tensor,
+        prompt_images: torch.Tensor,
+        prompt_boxes: torch.Tensor,
+        prompt_feats: Dict[str, torch.Tensor],
+        prompt_class_indices: torch.Tensor,
+        prompt_instance_mask: torch.Tensor,
+        prompt_class_mask: torch.Tensor,
         prompt_type: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        crop = crop_and_resize(support_image, support_box, self.crop_size)
+        batch_size, num_instances, _, image_h, image_w = prompt_images.shape
+        if prompt_class_mask.shape[1] > self.max_prompt_classes:
+            raise ValueError(
+                f"Batch contains {prompt_class_mask.shape[1]} prompt classes, "
+                f"but model.max_prompt_classes={self.max_prompt_classes}."
+            )
+
+        flat_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:])
+        flat_boxes = prompt_boxes.reshape(batch_size * num_instances, 4)
+        crop = crop_and_resize(flat_images, flat_boxes, self.crop_size)
         crop_feat = self.crop_encoder(crop)
         local_tokens = self.local_proj(crop_feat).flatten(2).transpose(1, 2)
-        crop_global = crop_feat.mean(dim=(2, 3))
-        support_global = support_feats["p5"].mean(dim=(2, 3))
+        token_count = local_tokens.shape[1]
+        local_tokens = local_tokens.view(batch_size, num_instances, token_count, -1)
 
-        box_norm = support_box.clone()
-        box_norm[:, 0::2] /= support_image.shape[-1]
-        box_norm[:, 1::2] /= support_image.shape[-2]
+        crop_global = crop_feat.mean(dim=(2, 3)).view(batch_size, num_instances, -1)
+        support_global = prompt_feats["p5"].mean(dim=(3, 4))
 
-        prompt_vec = self.global_proj(torch.cat([crop_global, support_global, box_norm], dim=1))
+        box_norm = prompt_boxes.clone()
+        box_norm[:, :, 0::2] /= max(image_w, 1)
+        box_norm[:, :, 1::2] /= max(image_h, 1)
 
-        label_embed = self.label_embed(prompt_label + 1)
+        prompt_vec = self.global_proj(torch.cat([crop_global, support_global, box_norm], dim=-1))
+
+        class_indices = prompt_class_indices.clamp(min=0, max=self.max_prompt_classes - 1)
+        class_slot_embed = self.class_slot_embed(class_indices)
         if self.training and self.label_dropout > 0:
-            keep = (torch.rand(prompt_label.shape[0], device=prompt_label.device) > self.label_dropout).float().unsqueeze(1)
-            label_embed = label_embed * keep
-        type_embed = self.type_embed(prompt_type)
-        global_prompt = self.refine(prompt_vec + label_embed + type_embed)
+            keep = (torch.rand_like(prompt_instance_mask.float()) > self.label_dropout).unsqueeze(-1)
+            class_slot_embed = class_slot_embed * keep
+        type_embed = self.type_embed(prompt_type).unsqueeze(1).expand_as(class_slot_embed)
+        instance_global = self.refine(prompt_vec + class_slot_embed + type_embed)
+        local_tokens = local_tokens + self.local_slot_proj(class_slot_embed).unsqueeze(2)
 
-        scale_tokens = {name: proj(global_prompt) for name, proj in self.scale_proj.items()}
+        instance_mask = prompt_instance_mask.float()
+        instance_global = instance_global * instance_mask.unsqueeze(-1)
+        local_tokens = local_tokens * instance_mask.unsqueeze(-1).unsqueeze(-1)
+
+        class_assign = F.one_hot(class_indices, num_classes=self.max_prompt_classes).float()
+        class_assign = class_assign * instance_mask.unsqueeze(-1)
+
+        class_counts = class_assign.sum(dim=1).clamp(min=1.0)
+        class_prototypes = torch.einsum("bpk,bpd->bkd", class_assign, instance_global) / class_counts.unsqueeze(-1)
+        class_local_tokens = torch.einsum("bpk,bplc->bklc", class_assign, local_tokens)
+        class_local_tokens = class_local_tokens / class_counts.unsqueeze(-1).unsqueeze(-1)
+
+        padded_class_mask = torch.zeros(
+            (batch_size, self.max_prompt_classes),
+            dtype=torch.bool,
+            device=prompt_class_mask.device,
+        )
+        padded_class_mask[:, :prompt_class_mask.shape[1]] = prompt_class_mask
+        class_prototypes = class_prototypes * padded_class_mask.unsqueeze(-1)
+        class_local_tokens = class_local_tokens * padded_class_mask.unsqueeze(-1).unsqueeze(-1)
+
+        memory_mask = padded_class_mask.unsqueeze(-1).expand(batch_size, self.max_prompt_classes, token_count)
+        memory_tokens = class_local_tokens.reshape(batch_size, self.max_prompt_classes * token_count, -1)
+        memory_mask = memory_mask.reshape(batch_size, self.max_prompt_classes * token_count)
+
+        global_prompt = masked_mean(class_prototypes, padded_class_mask, dim=1)
+        scale_tokens = {
+            name: proj(class_prototypes)
+            for name, proj in self.scale_proj.items()
+        }
+        scale_context = {
+            name: masked_mean(tokens, padded_class_mask, dim=1)
+            for name, tokens in scale_tokens.items()
+        }
+
         return {
             "global": global_prompt,
-            "local_tokens": local_tokens,
-            "scale_tokens": scale_tokens,
+            "memory_tokens": memory_tokens,
+            "memory_mask": memory_mask,
+            "class_prototypes": class_prototypes,
+            "class_mask": padded_class_mask,
+            "scale_context": scale_context,
         }

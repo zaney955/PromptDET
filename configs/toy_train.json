@@ -2,6 +2,7 @@
   "model": {
     "image_size": 256,
     "num_classes": 8,
+    "max_prompt_classes": 4,
     "backbone_widths": [48, 96, 192, 384],
     "neck_channels": 192,
     "prompt_dim": 256,
@@ -14,6 +15,10 @@
     "train_annotations": "./toy_data/train.json",
     "val_annotations": "./toy_data/val.json",
     "images_dir": "./toy_data/images",
+    "min_prompt_classes": 1,
+    "max_prompt_classes": 3,
+    "max_prompt_instances_per_class": 2,
+    "max_prompt_images": 4,
     "negative_ratio": 0.25,
     "hard_negative_ratio": 0.25,
     "episodes_per_epoch": 1000,

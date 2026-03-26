@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 class ModelConfig:
     image_size: int = 256
     num_classes: int = 8
+    max_prompt_classes: int = 4
     backbone_widths: List[int] = field(default_factory=lambda: [48, 96, 192, 384])
     neck_channels: int = 192
     prompt_dim: int = 256
@@ -26,6 +27,10 @@ class DataConfig:
     val_annotations: str = ""
     images_dir: str = ""
     category_map: str = ""
+    min_prompt_classes: int = 1
+    max_prompt_classes: int = 3
+    max_prompt_instances_per_class: int = 2
+    max_prompt_images: int = 4
     negative_ratio: float = 0.25
     hard_negative_ratio: float = 0.25
     episodes_per_epoch: int = 2000

@@ -19,13 +19,20 @@ class PromptQueryFusionBlock(nn.Module):
         self.sim_proj = nn.Conv2d(channels, channels, 1)
         self.refine = ConvBNAct(channels + 1, channels, 3)
 
-    def forward(self, x: torch.Tensor, local_tokens: torch.Tensor, global_prompt: torch.Tensor, scale_token: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        global_prompt: torch.Tensor,
+        scale_context: torch.Tensor,
+    ) -> torch.Tensor:
         b, c, h, w = x.shape
         query = x.flatten(2).transpose(1, 2)
         query = self.query_norm(query)
-        prompt_tokens = local_tokens + scale_token.unsqueeze(1)
         prompt_tokens = self.prompt_norm(prompt_tokens)
-        attn_out, _ = self.attn(query, prompt_tokens, prompt_tokens)
+        key_padding_mask = ~prompt_mask.bool()
+        attn_out, _ = self.attn(query, prompt_tokens, prompt_tokens, key_padding_mask=key_padding_mask)
         query = query + attn_out
         query = query + self.ffn(query)
         x = query.transpose(1, 2).reshape(b, c, h, w)
@@ -34,7 +41,7 @@ class PromptQueryFusionBlock(nn.Module):
         x = x * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
 
         sim_feat = self.sim_proj(x)
-        prompt_vec = scale_token / (scale_token.norm(dim=1, keepdim=True) + 1e-6)
+        prompt_vec = scale_context / (scale_context.norm(dim=1, keepdim=True) + 1e-6)
         feat_norm = sim_feat / (sim_feat.norm(dim=1, keepdim=True) + 1e-6)
         sim = (feat_norm * prompt_vec[:, :, None, None]).sum(dim=1, keepdim=True)
         return self.refine(torch.cat([x, sim], dim=1))
@@ -54,8 +61,9 @@ class PromptFusionNeck(nn.Module):
         for name, feat in feats.items():
             outputs[name] = self.blocks[name](
                 feat,
-                prompt["local_tokens"],
+                prompt["memory_tokens"],
+                prompt["memory_mask"],
                 prompt["global"],
-                prompt["scale_tokens"][name],
+                prompt["scale_context"][name],
             )
         return outputs

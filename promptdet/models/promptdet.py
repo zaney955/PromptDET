@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from promptdet.config import ModelConfig
@@ -22,31 +23,49 @@ class PromptDET(nn.Module):
         self.backbone = PromptDetBackbone(cfg.backbone_widths)
         self.neck = PromptDetNeck(self.backbone.out_channels, cfg.neck_channels)
         self.prompt_encoder = PromptEncoder(
-            num_classes=cfg.num_classes,
             prompt_dim=cfg.prompt_dim,
             out_channels=cfg.neck_channels,
             crop_size=cfg.prompt_crop_size,
             prompt_types=cfg.prompt_types,
             label_dropout=cfg.label_dropout,
+            max_prompt_classes=cfg.max_prompt_classes,
         )
         self.fusion = PromptFusionNeck(cfg.neck_channels, cfg.prompt_dim, cfg.num_attention_heads)
-        self.head = PromptDetectHead(cfg.neck_channels, cfg.reg_max)
+        self.head = PromptDetectHead(cfg.neck_channels, cfg.reg_max, cfg.prompt_dim)
         self.register_buffer("proj_bins", torch.arange(cfg.reg_max, dtype=torch.float32), persistent=False)
+        self.logit_scale = nn.Parameter(torch.tensor(2.0))
 
     def forward(
         self,
-        support_image: torch.Tensor,
-        support_box: torch.Tensor,
-        prompt_label: torch.Tensor,
+        prompt_images: torch.Tensor,
+        prompt_boxes: torch.Tensor,
+        prompt_class_indices: torch.Tensor,
+        prompt_instance_mask: torch.Tensor,
+        prompt_class_mask: torch.Tensor,
         query_image: torch.Tensor,
         prompt_type: torch.Tensor,
     ) -> Dict[str, List[torch.Tensor]]:
-        support_feats = self.neck(self.backbone(support_image))
+        batch_size, num_instances = prompt_images.shape[:2]
+        flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:])
+        flat_prompt_feats = self.neck(self.backbone(flat_prompt_images))
+        prompt_feats = {
+            name: feat.view(batch_size, num_instances, *feat.shape[1:])
+            for name, feat in flat_prompt_feats.items()
+        }
         query_feats = self.neck(self.backbone(query_image))
-        prompt = self.prompt_encoder(support_image, support_box, support_feats, prompt_label, prompt_type)
+        prompt = self.prompt_encoder(
+            prompt_images,
+            prompt_boxes,
+            prompt_feats,
+            prompt_class_indices,
+            prompt_instance_mask,
+            prompt_class_mask,
+            prompt_type,
+        )
         fused = self.fusion(query_feats, prompt)
         outputs = self.head(fused)
-        outputs["prompt_embedding"] = prompt["global"]
+        outputs["class_prototypes"] = prompt["class_prototypes"]
+        outputs["class_mask"] = prompt["class_mask"]
         return outputs
 
     def decode_raw(
@@ -54,46 +73,56 @@ class PromptDET(nn.Module):
         outputs: Dict[str, List[torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
         box_logits = outputs["box_logits"]
-        match_logits = outputs["match_logits"]
+        class_embeddings = outputs["class_embeddings"]
+        class_prototypes = outputs["class_prototypes"]
+        class_mask = outputs["class_mask"]
+
         batch = box_logits[0].shape[0]
         device = box_logits[0].device
         feature_shapes = [(h, w) for h, w in outputs["feature_shapes"]]
-        anchor_points, stride_tensor = make_anchors(feature_shapes, outputs["strides"], device=device)
+        anchor_points, _ = make_anchors(feature_shapes, outputs["strides"], device=device)
 
         box_parts = []
-        score_parts = []
+        embedding_parts = []
         stride_parts = []
         flat_box_logits = []
-        for box_logit, match_logit, stride in zip(box_logits, match_logits, outputs["strides"]):
+        for box_logit, class_embedding, stride in zip(box_logits, class_embeddings, outputs["strides"]):
             b, _, h, w = box_logit.shape
             box_logit = box_logit.view(b, 4, self.cfg.reg_max, h, w).permute(0, 3, 4, 1, 2).reshape(b, h * w, 4, self.cfg.reg_max)
             probs = box_logit.softmax(dim=-1)
             dist = (probs * self.proj_bins.to(device)).sum(dim=-1) * stride
             box_parts.append(dist)
             flat_box_logits.append(box_logit)
-            score_parts.append(match_logit.flatten(2).transpose(1, 2))
+            embedding_parts.append(class_embedding.flatten(2).transpose(1, 2))
             stride_parts.append(torch.full((h * w, 1), stride, device=device))
 
         pred_dist = torch.cat(box_parts, dim=1)
-        pred_scores = torch.cat(score_parts, dim=1).squeeze(-1)
+        query_embeddings = torch.cat(embedding_parts, dim=1)
         pred_boxes = []
         for batch_idx in range(batch):
             pred_boxes.append(dist2bbox(anchor_points, pred_dist[batch_idx]))
         pred_boxes = torch.stack(pred_boxes, dim=0)
+
+        query_embeddings = F.normalize(query_embeddings, dim=-1)
+        class_prototypes = F.normalize(class_prototypes, dim=-1)
+        pred_scores = torch.einsum("bnd,bkd->bnk", query_embeddings, class_prototypes) * self.logit_scale.exp()
+        pred_scores = pred_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
+
         return {
             "pred_boxes": pred_boxes,
             "pred_scores": pred_scores,
             "anchor_points": anchor_points,
             "stride_tensor": torch.cat(stride_parts, dim=0),
             "box_distribution": torch.cat(flat_box_logits, dim=1),
-            "prompt_embedding": outputs["prompt_embedding"],
+            "class_mask": class_mask,
         }
 
     @torch.no_grad()
     def predict(
         self,
         outputs: Dict[str, List[torch.Tensor]],
-        prompt_label: torch.Tensor,
+        prompt_class_ids: torch.Tensor,
+        prompt_class_mask: torch.Tensor,
         image_size: int,
         conf_threshold: float = 0.25,
         nms_iou_threshold: float = 0.5,
@@ -102,12 +131,35 @@ class PromptDET(nn.Module):
         decoded = self.decode_raw(outputs)
         pred_boxes = decoded["pred_boxes"]
         pred_scores = decoded["pred_scores"].sigmoid()
+        decoded_class_mask = decoded["class_mask"]
         results = []
-        for boxes, scores, label in zip(pred_boxes, pred_scores, prompt_label):
+        for batch_idx, (boxes, class_scores, class_ids, class_mask) in enumerate(zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask)):
+            padded_class_ids = torch.full(
+                (self.cfg.max_prompt_classes,),
+                -1,
+                dtype=class_ids.dtype,
+                device=class_ids.device,
+            )
+            padded_mask = torch.zeros((self.cfg.max_prompt_classes,), dtype=torch.bool, device=class_mask.device)
+            limit = min(class_ids.shape[0], self.cfg.max_prompt_classes)
+            padded_class_ids[:limit] = class_ids[:limit]
+            padded_mask[:limit] = class_mask[:limit]
+            effective_mask = padded_mask & decoded_class_mask[batch_idx]
+
+            valid_class_ids = padded_class_ids[effective_mask]
+            valid_scores = class_scores[:, effective_mask]
+            if valid_scores.numel() == 0:
+                results.append({
+                    "boxes": boxes.new_zeros((0, 4)),
+                    "scores": boxes.new_zeros((0,)),
+                    "labels": class_ids.new_zeros((0,)),
+                })
+                continue
+            scores, class_index = valid_scores.max(dim=1)
             keep = scores > conf_threshold
             boxes = clamp_boxes(boxes[keep], image_size, image_size)
             scores = scores[keep]
-            labels = torch.full((scores.shape[0],), int(label.item()), dtype=torch.long, device=scores.device)
+            labels = valid_class_ids[class_index[keep]]
             keep_idx = batched_nms(boxes, scores, labels, nms_iou_threshold)
             keep_idx = keep_idx[:max_det]
             results.append({

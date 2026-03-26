@@ -26,16 +26,69 @@ def resize_image(image: Image.Image, size: int) -> torch.Tensor:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run PromptDET inference on one prompt-query pair.")
+    parser = argparse.ArgumentParser(description="Run PromptDET inference on one prompt-query pair or a prompt set.")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--prompt-image", type=str, required=True)
-    parser.add_argument("--prompt-box", type=float, nargs=4, required=True, help="x1 y1 x2 y2 on the original prompt image")
-    parser.add_argument("--prompt-label", type=int, required=True)
+    parser.add_argument("--prompt-spec", type=str, default=None, help="JSON file describing a prompt set.")
+    parser.add_argument("--prompt-image", type=str, default=None)
+    parser.add_argument("--prompt-box", type=float, nargs=4, default=None, help="x1 y1 x2 y2 on the original prompt image")
+    parser.add_argument("--prompt-label", type=int, default=None)
     parser.add_argument("--query-image", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
+
+
+def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
+    if args.prompt_spec:
+        payload = json.loads(Path(args.prompt_spec).read_text(encoding="utf-8"))
+        prompts = payload["prompts"]
+    else:
+        if args.prompt_image is None or args.prompt_box is None or args.prompt_label is None:
+            raise ValueError("Single prompt mode requires --prompt-image, --prompt-box and --prompt-label.")
+        prompts = [{
+            "image": args.prompt_image,
+            "annotations": [{"bbox": args.prompt_box, "label": args.prompt_label}],
+        }]
+
+    prompt_images = []
+    prompt_boxes = []
+    prompt_class_indices = []
+    label_to_slot = {}
+
+    for prompt in prompts:
+        prompt_image = Image.open(prompt["image"]).convert("RGB")
+        resized = resize_image(prompt_image, image_size)
+        scale_x = image_size / prompt_image.size[0]
+        scale_y = image_size / prompt_image.size[1]
+        for ann in prompt["annotations"]:
+            label = int(ann["label"])
+            slot = label_to_slot.setdefault(label, len(label_to_slot))
+            bbox = torch.tensor(ann["bbox"], dtype=torch.float32)
+            bbox[0::2] *= scale_x
+            bbox[1::2] *= scale_y
+            prompt_images.append(resized)
+            prompt_boxes.append(bbox)
+            prompt_class_indices.append(slot)
+
+    if not prompt_images:
+        raise ValueError("Prompt set is empty.")
+    if len(label_to_slot) > max_prompt_classes:
+        raise ValueError("Prompt set exceeds model.max_prompt_classes.")
+
+    prompt_class_ids = [None] * len(label_to_slot)
+    for label, slot in label_to_slot.items():
+        prompt_class_ids[slot] = label
+
+    return {
+        "prompt_images": torch.stack(prompt_images, dim=0).unsqueeze(0),
+        "prompt_boxes": torch.stack(prompt_boxes, dim=0).unsqueeze(0),
+        "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long).unsqueeze(0),
+        "prompt_instance_mask": torch.ones((1, len(prompt_images)), dtype=torch.bool),
+        "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long).unsqueeze(0),
+        "prompt_class_mask": torch.ones((1, len(prompt_class_ids)), dtype=torch.bool),
+        "prompt_type": torch.tensor([0], dtype=torch.long),
+    }
 
 
 def main():
@@ -49,22 +102,24 @@ def main():
     load_checkpoint(args.checkpoint, model, map_location=device.type)
     model.eval()
 
-    prompt_pil = Image.open(args.prompt_image).convert("RGB")
+    prompt_batch = _load_prompt_set(args, config.model.image_size, config.model.max_prompt_classes)
     query_pil = Image.open(args.query_image).convert("RGB")
-    prompt_tensor = resize_image(prompt_pil, config.model.image_size).unsqueeze(0).to(device)
     query_tensor = resize_image(query_pil, config.model.image_size).unsqueeze(0).to(device)
 
-    box = torch.tensor([args.prompt_box], dtype=torch.float32)
-    box[:, 0::2] *= config.model.image_size / prompt_pil.size[0]
-    box[:, 1::2] *= config.model.image_size / prompt_pil.size[1]
-    prompt_label = torch.tensor([args.prompt_label], dtype=torch.long, device=device)
-    prompt_type = torch.tensor([0], dtype=torch.long, device=device)
-
     with torch.no_grad():
-        raw = model(prompt_tensor, box.to(device), prompt_label, query_tensor, prompt_type)
+        raw = model(
+            prompt_batch["prompt_images"].to(device),
+            prompt_batch["prompt_boxes"].to(device),
+            prompt_batch["prompt_class_indices"].to(device),
+            prompt_batch["prompt_instance_mask"].to(device),
+            prompt_batch["prompt_class_mask"].to(device),
+            query_tensor,
+            prompt_batch["prompt_type"].to(device),
+        )
         preds = model.predict(
             raw,
-            prompt_label,
+            prompt_batch["prompt_class_ids"].to(device),
+            prompt_batch["prompt_class_mask"].to(device),
             image_size=config.model.image_size,
             conf_threshold=config.train.conf_threshold,
             nms_iou_threshold=config.train.nms_iou_threshold,

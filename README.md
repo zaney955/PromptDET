@@ -2,12 +2,11 @@
 
 PromptDET is a prompt-conditioned detector built from scratch for the workflow:
 
-- prompt image
-- prompt bounding box
-- prompt label
+- prompt set of one or more annotated images
+- one or more selected categories defined by prompt examples
 - query image
 
-The model predicts all query boxes that match the prompted target category. The implementation combines:
+The model predicts all query boxes that belong to the categories dynamically defined by the prompt set. The implementation combines:
 
 - SegGPT-style prompt-conditioned support/query interaction
 - YOLO-style multi-scale dense detection
@@ -66,7 +65,17 @@ python train.py \
   --device cuda
 ```
 
+Sampling behavior is controlled in `configs/toy_train.json`:
+
+- `data.min_prompt_classes` / `data.max_prompt_classes`
+- `data.max_prompt_instances_per_class`
+- `data.max_prompt_images`
+- `data.negative_ratio`
+- `data.hard_negative_ratio`
+
 ## Inference
+
+Single-prompt compatibility mode:
 
 ```bash
 python detect.py \
@@ -79,6 +88,39 @@ python detect.py \
   --output-dir ./outputs/infer_demo
 ```
 
+Prompt-set mode:
+
+```bash
+python detect.py \
+  --config ./outputs/exp1/config.json \
+  --checkpoint ./outputs/exp1/best.pt \
+  --prompt-spec ./examples/prompt_set.json \
+  --query-image ./toy_data/images/val_00001.png \
+  --output-dir ./outputs/infer_prompt_set
+```
+
+`prompt_spec` format:
+
+```json
+{
+  "prompts": [
+    {
+      "image": "./toy_data/images/train_00000.png",
+      "annotations": [
+        {"bbox": [10, 20, 80, 90], "label": 0},
+        {"bbox": [100, 30, 150, 120], "label": 1}
+      ]
+    },
+    {
+      "image": "./toy_data/images/train_00007.png",
+      "annotations": [
+        {"bbox": [35, 40, 95, 110], "label": 0}
+      ]
+    }
+  ]
+}
+```
+
 Outputs:
 
 - `prediction.json`
@@ -88,12 +130,12 @@ Outputs:
 
 Implemented:
 
-- full modular prompt-conditioned detector
+- full modular prompt-conditioned detector with prompt-set episodes
 - shared backbone and PAN/FPN neck
-- prompt crop encoder
+- prompt crop encoder with multi-instance class prototype aggregation
 - cross-attention prompt/query fusion
 - dense detection head with DFL regression
-- task-aligned assignment
+- dynamic prompt-class assignment
 - training and validation loops
 - standalone inference script
 - toy dataset generator for smoke tests

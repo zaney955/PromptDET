@@ -1,0 +1,26 @@
+{
+  "prompts": [
+    {
+      "image": "./toy_data/images/train_00000.png",
+      "annotations": [
+        {
+          "bbox": [10, 20, 80, 90],
+          "label": 0
+        },
+        {
+          "bbox": [100, 30, 150, 120],
+          "label": 1
+        }
+      ]
+    },
+    {
+      "image": "./toy_data/images/train_00007.png",
+      "annotations": [
+        {
+          "bbox": [35, 40, 95, 110],
+          "label": 0
+        }
+      ]
+    }
+  ]
+}
