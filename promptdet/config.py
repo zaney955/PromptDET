@@ -55,6 +55,7 @@ class TrainConfig:
     conf_threshold: float = 0.15
     nms_iou_threshold: float = 0.5
     pre_nms_topk: int = 256
+    one2one_topk: int = 300
     max_det: int = 100
     eval_interval: int = 1
     save_interval: int = 1
@@ -67,6 +68,7 @@ class LossConfig:
     tal_alpha: float = 1.0
     tal_beta: float = 6.0
     center_sampling_radius: float = 0.5
+    one2one_center_sampling_radius: float = 0.75
     objectness_weight: float = 1.0
     match_weight: float = 1.0
     iou_weight: float = 7.5
@@ -75,6 +77,8 @@ class LossConfig:
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     classification_margin: float = 0.2
+    one2many_weight: float = 1.0
+    one2one_weight: float = 1.5
 
 
 @dataclass

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from promptdet.config import ModelConfig
-from promptdet.utils.box_ops import clamp_boxes, dist2bbox, make_anchors, nms
+from promptdet.utils.box_ops import clamp_boxes, dist2bbox, make_anchors
 
 from .backbone import PromptDetBackbone
 from .fusion import PromptFusionNeck
@@ -45,7 +45,7 @@ class PromptDET(nn.Module):
         prompt_class_mask: torch.Tensor,
         query_image: torch.Tensor,
         prompt_type: torch.Tensor,
-    ) -> Dict[str, List[torch.Tensor]]:
+    ) -> Dict[str, Dict[str, List[torch.Tensor]]]:
         batch_size, num_instances = prompt_images.shape[:2]
         flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous(
             memory_format=torch.channels_last
@@ -67,17 +67,16 @@ class PromptDET(nn.Module):
             prompt_type,
         )
         fused = self.fusion(query_feats, prompt)
-        outputs = self.head(fused)
-        outputs["class_prototypes"] = prompt["class_prototypes"]
-        outputs["class_mask"] = prompt["class_mask"]
+        branches = self.head(fused)
         max_scale = math.exp(self.cfg.max_logit_scale)
-        outputs["logit_scale"] = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
-        return outputs
+        logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
+        for branch in branches.values():
+            branch["class_prototypes"] = prompt["class_prototypes"]
+            branch["class_mask"] = prompt["class_mask"]
+            branch["logit_scale"] = logit_scale
+        return branches
 
-    def decode_raw(
-        self,
-        outputs: Dict[str, List[torch.Tensor]],
-    ) -> Dict[str, torch.Tensor]:
+    def _decode_branch(self, outputs: Dict[str, List[torch.Tensor]]) -> Dict[str, torch.Tensor]:
         box_logits = outputs["box_logits"]
         objectness_logits = outputs["objectness_logits"]
         class_embeddings = outputs["class_embeddings"]
@@ -102,7 +101,9 @@ class PromptDET(nn.Module):
             outputs["strides"],
         ):
             b, _, h, w = box_logit.shape
-            box_logit = box_logit.view(b, 4, self.cfg.reg_max, h, w).permute(0, 3, 4, 1, 2).reshape(b, h * w, 4, self.cfg.reg_max)
+            box_logit = box_logit.view(b, 4, self.cfg.reg_max, h, w).permute(0, 3, 4, 1, 2).reshape(
+                b, h * w, 4, self.cfg.reg_max
+            )
             probs = box_logit.softmax(dim=-1)
             dist = (probs * self.proj_bins.to(device)).sum(dim=-1) * stride
             box_parts.append(dist)
@@ -134,25 +135,39 @@ class PromptDET(nn.Module):
             "class_mask": class_mask,
         }
 
+    def decode_raw(
+        self,
+        outputs: Dict[str, Dict[str, List[torch.Tensor]]],
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        return {
+            "one2many": self._decode_branch(outputs["one2many"]),
+            "one2one": self._decode_branch(outputs["one2one"]),
+        }
+
     @torch.no_grad()
     def predict(
         self,
-        outputs: Dict[str, List[torch.Tensor]],
+        outputs: Dict[str, Dict[str, List[torch.Tensor]]] | Dict[str, Dict[str, torch.Tensor]],
         prompt_class_ids: torch.Tensor,
         prompt_class_mask: torch.Tensor,
         image_size: int,
         conf_threshold: float = 0.25,
         nms_iou_threshold: float = 0.5,
         pre_nms_topk: int = 256,
+        one2one_topk: int = 300,
         max_det: int = 100,
     ) -> List[Dict[str, torch.Tensor]]:
-        decoded = self.decode_raw(outputs)
-        pred_boxes = decoded["pred_boxes"]
-        pred_scores = decoded["pred_scores"].sigmoid()
-        pred_objectness = decoded["pred_objectness"].sigmoid()
-        decoded_class_mask = decoded["class_mask"]
+        decoded = outputs if "one2one" in outputs and "pred_boxes" in outputs["one2one"] else self.decode_raw(outputs)
+        branch = decoded["one2one"]
+        pred_boxes = branch["pred_boxes"]
+        pred_scores = branch["pred_scores"].sigmoid()
+        pred_objectness = branch["pred_objectness"].sigmoid()
+        decoded_class_mask = branch["class_mask"]
+
         results = []
-        for batch_idx, (boxes, class_scores, class_ids, class_mask) in enumerate(zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask)):
+        for batch_idx, (boxes, class_scores, class_ids, class_mask) in enumerate(
+            zip(pred_boxes, pred_scores, prompt_class_ids, prompt_class_mask)
+        ):
             padded_class_ids = torch.full(
                 (self.cfg.max_prompt_classes,),
                 -1,
@@ -174,6 +189,7 @@ class PromptDET(nn.Module):
                     "labels": class_ids.new_zeros((0,)),
                 })
                 continue
+
             class_scores_max, class_index = valid_scores.max(dim=1)
             scores = torch.sqrt((class_scores_max * pred_objectness[batch_idx]).clamp(min=0.0))
             if scores.numel() > pre_nms_topk:
@@ -185,11 +201,14 @@ class PromptDET(nn.Module):
             boxes = clamp_boxes(boxes[keep], image_size, image_size)
             scores = scores[keep]
             labels = valid_class_ids[class_index[keep]]
-            keep_idx = nms(boxes, scores, nms_iou_threshold)
-            keep_idx = keep_idx[:max_det]
+            if scores.numel() > one2one_topk:
+                scores, top_idx = torch.topk(scores, k=one2one_topk)
+                boxes = boxes[top_idx]
+                labels = labels[top_idx]
+            order = scores.argsort(descending=True)[:max_det]
             results.append({
-                "boxes": boxes[keep_idx],
-                "scores": scores[keep_idx],
-                "labels": labels[keep_idx],
+                "boxes": boxes[order],
+                "scores": scores[order],
+                "labels": labels[order],
             })
         return results

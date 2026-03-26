@@ -71,6 +71,8 @@ def train(
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.train.epochs}", leave=False, disable=not is_main_process())
         epoch_stats = {
             "loss": 0.0,
+            "loss_one2many": 0.0,
+            "loss_one2one": 0.0,
             "loss_objectness": 0.0,
             "loss_match": 0.0,
             "loss_iou": 0.0,
@@ -125,6 +127,8 @@ def train(
             num_steps += 1
             pbar.set_postfix(
                 loss=f"{float(loss.item()):.4f}",
+                o2m=f"{float(losses['loss_one2many'].item()):.4f}",
+                o2o=f"{float(losses['loss_one2one'].item()):.4f}",
                 obj=f"{float(losses['loss_objectness'].item()):.4f}",
                 pos=f"{float(losses['num_pos'].item()):.1f}",
                 ps=f"{float(losses['mean_pos_score'].item()):.3f}",
@@ -145,6 +149,7 @@ def train(
                 conf_threshold=config.train.conf_threshold,
                 nms_iou_threshold=config.train.nms_iou_threshold,
                 pre_nms_topk=config.train.pre_nms_topk,
+                one2one_topk=config.train.one2one_topk,
                 max_det=config.train.max_det,
             )
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})
