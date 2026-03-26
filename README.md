@@ -6,12 +6,18 @@ PromptDET is a prompt-conditioned detector built from scratch for the workflow:
 - one or more selected categories defined by prompt examples
 - query image
 
-The model predicts all query boxes that belong to the categories dynamically defined by the prompt set. The implementation combines:
+The model predicts all query boxes that belong to the categories dynamically defined by the prompt set.
+Prompt labels are episode-local identity tokens used to group prompt instances into classes for that episode. They are not natural-language semantics and should not be treated as globally meaningful category embeddings.
+
+The implementation combines:
 
 - SegGPT-style prompt-conditioned support/query interaction
 - YOLO-style multi-scale dense detection
 - DFL-based box regression
-- task-aligned top-k assignment
+- dual detection heads:
+  - `one2many` for dense auxiliary supervision during training
+  - `one2one` for unique-matching final inference
+- quality-aware matching and NMS-free `one2one` inference with local peak filtering
 
 ## Project Layout
 
@@ -138,6 +144,8 @@ python detect.py \
 ```
 
 When `prompt_set.json` lives inside `toy_data/`, image paths are resolved relative to that JSON file. The `label` field is the dataset `category_id` from `train.json`, not a free-form class name.
+For the toy dataset, this keeps `prompt_set.json` consistent with `train.json`.
+Conceptually, `label` is just the identity token used to indicate which prompt annotations belong to the same prompt-defined class within that episode.
 
 You can validate the generated toy dataset and prompt spec with:
 
@@ -150,6 +158,19 @@ Outputs:
 - `prediction.json`
 - `prediction.png`
 
+## Detection Behavior
+
+Inference uses the `one2one` branch only.
+The intended prediction path is:
+
+- decode `one2one`
+- apply local peak filtering
+- combine objectness and prompt-class confidence into a quality-aware score
+- threshold
+- top-k
+
+The main inference path is NMS-free by design. `nms_iou_threshold` may still exist in configs or CLI for compatibility, but NMS is not part of the intended final prediction behavior.
+
 ## Current Scope
 
 Implemented:
@@ -158,19 +179,20 @@ Implemented:
 - shared backbone and PAN/FPN neck
 - prompt crop encoder with multi-instance class prototype aggregation
 - cross-attention prompt/query fusion
-- dense detection head with DFL regression
+- dual-branch dense detection head with DFL regression
 - dynamic prompt-class assignment
+- `one2one` unique matching with duplicate suppression supervision
+- local peak filtering for NMS-free `one2one` inference
 - training and validation loops
+- single-node distributed training with DDP
 - standalone inference script
 - toy dataset generator for smoke tests
 
 Not yet implemented:
 
-- distributed training
 - multi-prompt inference pool
 - same-instance mode
 - text prompt encoder
-- end-to-end one-to-one NMS-free branch
 
 ## Dataset Format
 

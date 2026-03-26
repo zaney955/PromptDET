@@ -33,6 +33,8 @@ def _move_targets(targets, device: torch.device):
             "boxes": target["boxes"].to(device),
             "labels": target["labels"].to(device),
             "category_ids": target["category_ids"].to(device),
+            "non_target_boxes": target["non_target_boxes"].to(device),
+            "non_target_weights": target["non_target_weights"].to(device),
             "image_size": target["image_size"],
         })
     return moved

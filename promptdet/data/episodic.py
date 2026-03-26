@@ -41,6 +41,7 @@ class PromptEpisodeDataset(Dataset):
         max_prompt_classes: int = 3,
         max_prompt_instances_per_class: int = 2,
         max_prompt_images: int = 4,
+        confusable_non_target_weight: float = 2.0,
     ):
         super().__init__()
         payload = json.loads(Path(annotations_path).read_text(encoding="utf-8"))
@@ -54,6 +55,7 @@ class PromptEpisodeDataset(Dataset):
         self.max_prompt_classes = max_prompt_classes
         self.max_prompt_instances_per_class = max_prompt_instances_per_class
         self.max_prompt_images = max_prompt_images
+        self.confusable_non_target_weight = confusable_non_target_weight
 
         self.image_records = {item["id"]: item for item in payload["images"]}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -238,9 +240,16 @@ class PromptEpisodeDataset(Dataset):
         query_boxes = []
         query_labels = []
         query_category_ids = []
+        non_target_boxes = []
+        non_target_weights = []
+        confusable_class_set = self._get_confusable_classes(sampled_prompt_class_ids)
         for ann in query_anns:
             class_slot = class_to_slot.get(ann["category_id"])
             if class_slot is None:
+                non_target_boxes.append(ann["bbox"])
+                non_target_weights.append(
+                    self.confusable_non_target_weight if ann["category_id"] in confusable_class_set else 1.0
+                )
                 continue
             query_boxes.append(ann["bbox"])
             query_labels.append(class_slot)
@@ -255,7 +264,15 @@ class PromptEpisodeDataset(Dataset):
             query_labels_tensor = torch.zeros((0,), dtype=torch.long)
             query_category_ids_tensor = torch.zeros((0,), dtype=torch.long)
 
+        if non_target_boxes:
+            non_target_boxes_tensor = torch.tensor(non_target_boxes, dtype=torch.float32)
+            non_target_weights_tensor = torch.tensor(non_target_weights, dtype=torch.float32)
+        else:
+            non_target_boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            non_target_weights_tensor = torch.zeros((0,), dtype=torch.float32)
+
         query_image_tensor, query_boxes_tensor = resize_image_and_boxes(query_image, query_boxes_tensor, self.image_size)
+        _, non_target_boxes_tensor = resize_image_and_boxes(query_image, non_target_boxes_tensor, self.image_size)
 
         return {
             "prompt_images": torch.stack(prompt_images, dim=0),
@@ -267,6 +284,8 @@ class PromptEpisodeDataset(Dataset):
             "query_boxes": query_boxes_tensor,
             "query_labels": query_labels_tensor,
             "query_category_ids": query_category_ids_tensor,
+            "query_non_target_boxes": non_target_boxes_tensor,
+            "query_non_target_weights": non_target_weights_tensor,
             "image_size": torch.tensor(self.image_size, dtype=torch.long),
             "is_positive": torch.tensor(int(positive and query_boxes_tensor.shape[0] > 0), dtype=torch.long),
         }
@@ -309,6 +328,8 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
                 "boxes": item["query_boxes"],
                 "labels": item["query_labels"],
                 "category_ids": item["query_category_ids"],
+                "non_target_boxes": item["query_non_target_boxes"],
+                "non_target_weights": item["query_non_target_weights"],
                 "image_size": int(item["image_size"].item()),
             }
             for item in batch

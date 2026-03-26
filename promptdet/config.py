@@ -72,11 +72,14 @@ class LossConfig:
     one2one_center_sampling_radius: float = 0.75
     one2one_candidate_topk: int = 8
     one2one_duplicate_radius: float = 1.25
+    non_target_center_sampling_radius: float = 0.75
     objectness_weight: float = 1.0
     match_weight: float = 1.0
     iou_weight: float = 7.5
     dfl_weight: float = 1.5
     duplicate_weight: float = 0.5
+    non_target_weight: float = 1.0
+    confusable_non_target_weight: float = 2.0
     contrast_weight: float = 0.0
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0

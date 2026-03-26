@@ -38,6 +38,48 @@ def sigmoid_varifocal_loss(
     return loss
 
 
+def weighted_mean(loss: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    while weights.dim() < loss.dim():
+        weights = weights.unsqueeze(-1)
+    return (loss * weights).sum() / weights.sum().clamp(min=eps)
+
+
+def build_box_region_weights(
+    anchor_points: torch.Tensor,
+    boxes: torch.Tensor,
+    box_weights: torch.Tensor,
+    center_sampling_radius: float,
+) -> torch.Tensor:
+    num_points = anchor_points.shape[0]
+    weights = anchor_points.new_zeros((num_points,))
+    if boxes.numel() == 0:
+        return weights
+    if box_weights.numel() == 0:
+        box_weights = boxes.new_ones((boxes.shape[0],))
+
+    for box, box_weight in zip(boxes, box_weights):
+        inside = (
+            (anchor_points[:, 0] >= box[0])
+            & (anchor_points[:, 0] <= box[2])
+            & (anchor_points[:, 1] >= box[1])
+            & (anchor_points[:, 1] <= box[3])
+        )
+        if not inside.any():
+            continue
+        gt_center = (box[:2] + box[2:]) * 0.5
+        half_size = ((box[2:] - box[:2]) * 0.5).clamp(min=1.0)
+        center_delta = (anchor_points - gt_center).abs() / half_size
+        center_mask = center_delta.max(dim=1).values <= center_sampling_radius
+        candidate_mask = inside & center_mask
+        if not candidate_mask.any():
+            candidate_mask = inside
+        weights[candidate_mask] = torch.maximum(
+            weights[candidate_mask],
+            weights.new_full((int(candidate_mask.sum().item()),), float(box_weight.item())),
+        )
+    return weights
+
+
 class PromptTaskAlignedAssigner:
     def __init__(self, topk: int = 13, alpha: float = 1.0, beta: float = 6.0, center_sampling_radius: float = 0.5):
         self.topk = topk
@@ -284,10 +326,13 @@ class PromptDetectionLoss(torch.nn.Module):
         total_pos_score_sum = pred_scores.new_tensor(0.0)
         total_neg_score_sum = pred_scores.new_tensor(0.0)
         total_matched_iou_sum = pred_scores.new_tensor(0.0)
+        non_target_radius = getattr(assigner, "center_sampling_radius", self.cfg.non_target_center_sampling_radius)
 
         for batch_idx, target in enumerate(targets):
             gt_boxes = target["boxes"]
             gt_labels = target["labels"]
+            non_target_boxes = target.get("non_target_boxes")
+            non_target_weights = target.get("non_target_weights")
             valid_class_mask = class_mask[batch_idx]
             assign = assigner.assign(
                 pred_scores[batch_idx],
@@ -367,6 +412,43 @@ class PromptDetectionLoss(torch.nn.Module):
                         gamma=self.cfg.focal_gamma,
                         reduction="mean",
                     )
+
+            prompt_region_weights = build_box_region_weights(
+                anchor_points,
+                gt_boxes,
+                gt_boxes.new_ones((gt_boxes.shape[0],)) if gt_boxes.numel() > 0 else gt_boxes.new_zeros((0,)),
+                center_sampling_radius=non_target_radius,
+            )
+            non_target_region_weights = build_box_region_weights(
+                anchor_points,
+                non_target_boxes,
+                non_target_weights,
+                center_sampling_radius=self.cfg.non_target_center_sampling_radius,
+            )
+            non_target_region_weights = non_target_region_weights * self.cfg.non_target_weight
+            non_target_mask = (non_target_region_weights > 0) & ~assign.fg_mask & ~assign.duplicate_mask
+            non_target_mask &= prompt_region_weights <= 0
+            if non_target_mask.any():
+                region_weights = non_target_region_weights[non_target_mask]
+                non_target_objectness = sigmoid_varifocal_loss(
+                    pred_objectness[batch_idx][non_target_mask],
+                    torch.zeros_like(pred_objectness[batch_idx][non_target_mask]),
+                    alpha=self.cfg.focal_alpha,
+                    gamma=self.cfg.focal_gamma,
+                    reduction="none",
+                )
+                total_objectness = total_objectness + weighted_mean(non_target_objectness, region_weights)
+
+                non_target_scores = pred_scores[batch_idx][non_target_mask][:, valid_class_mask]
+                if non_target_scores.numel() > 0:
+                    non_target_match = sigmoid_varifocal_loss(
+                        non_target_scores,
+                        torch.zeros_like(non_target_scores),
+                        alpha=self.cfg.focal_alpha,
+                        gamma=self.cfg.focal_gamma,
+                        reduction="none",
+                    )
+                    total_match = total_match + weighted_mean(non_target_match, region_weights)
 
             neg_mask = ~assign.fg_mask
             neg_count = int(neg_mask.sum().item())

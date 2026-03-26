@@ -77,6 +77,7 @@ def main():
         max_prompt_classes=config.data.max_prompt_classes,
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
+        confusable_non_target_weight=config.loss.confusable_non_target_weight,
     )
     val_dataset = PromptEpisodeDataset(
         annotations_path=config.data.val_annotations,
@@ -89,6 +90,7 @@ def main():
         max_prompt_classes=config.data.max_prompt_classes,
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
+        confusable_non_target_weight=config.loss.confusable_non_target_weight,
     )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist_info["distributed"] else None
