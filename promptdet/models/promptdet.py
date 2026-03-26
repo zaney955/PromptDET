@@ -72,6 +72,7 @@ class PromptDET(nn.Module):
         logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         for branch in branches.values():
             branch["class_prototypes"] = prompt["class_prototypes"]
+            branch["class_detail_tokens"] = prompt["class_detail_tokens"]
             branch["class_mask"] = prompt["class_mask"]
             branch["logit_scale"] = logit_scale
         return branches
@@ -81,6 +82,7 @@ class PromptDET(nn.Module):
         objectness_logits = outputs["objectness_logits"]
         class_embeddings = outputs["class_embeddings"]
         class_prototypes = outputs["class_prototypes"]
+        class_detail_tokens = outputs["class_detail_tokens"]
         class_mask = outputs["class_mask"]
         logit_scale = outputs["logit_scale"]
 
@@ -131,7 +133,13 @@ class PromptDET(nn.Module):
 
         query_embeddings = F.normalize(query_embeddings, dim=-1)
         class_prototypes = F.normalize(class_prototypes, dim=-1)
-        pred_scores = torch.einsum("bnd,bkd->bnk", query_embeddings, class_prototypes) * logit_scale
+        class_detail_tokens = F.normalize(class_detail_tokens, dim=-1)
+        global_scores = torch.einsum("bnd,bkd->bnk", query_embeddings, class_prototypes)
+        detail_scores = torch.einsum("bnd,bktd->bnkt", query_embeddings, class_detail_tokens).max(dim=-1).values
+        pred_scores = (
+            (1.0 - self.cfg.detail_score_weight) * global_scores
+            + self.cfg.detail_score_weight * detail_scores
+        ) * logit_scale
         pred_scores = pred_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
 
         return {

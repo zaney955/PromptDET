@@ -20,6 +20,7 @@ class ModelConfig:
     label_dropout: float = 0.4
     logit_scale_init: float = 1.5
     max_logit_scale: float = 2.5
+    detail_score_weight: float = 0.5
     prompt_types: List[str] = field(default_factory=lambda: ["same_category", "same_instance", "part", "defect"])
 
 

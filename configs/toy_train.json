@@ -11,7 +11,8 @@
     "prompt_crop_size": 128,
     "label_dropout": 0.4,
     "logit_scale_init": 1.5,
-    "max_logit_scale": 2.5
+    "max_logit_scale": 2.5,
+    "detail_score_weight": 0.5
   },
   "data": {
     "train_annotations": "./toy_data/train.json",
