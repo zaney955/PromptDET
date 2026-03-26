@@ -144,6 +144,7 @@ def train(
                 device=device,
                 conf_threshold=config.train.conf_threshold,
                 nms_iou_threshold=config.train.nms_iou_threshold,
+                pre_nms_topk=config.train.pre_nms_topk,
                 max_det=config.train.max_det,
             )
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})

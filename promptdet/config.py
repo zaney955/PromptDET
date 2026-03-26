@@ -18,6 +18,8 @@ class ModelConfig:
     num_attention_heads: int = 8
     prompt_crop_size: int = 128
     label_dropout: float = 0.4
+    logit_scale_init: float = 1.5
+    max_logit_scale: float = 2.5
     prompt_types: List[str] = field(default_factory=lambda: ["same_category", "same_instance", "part", "defect"])
 
 
@@ -50,8 +52,9 @@ class TrainConfig:
     seed: int = 42
     mixed_precision: bool = True
     grad_clip: float = 5.0
-    conf_threshold: float = 0.25
+    conf_threshold: float = 0.15
     nms_iou_threshold: float = 0.5
+    pre_nms_topk: int = 256
     max_det: int = 100
     eval_interval: int = 1
     save_interval: int = 1
@@ -63,6 +66,7 @@ class LossConfig:
     tal_topk: int = 9
     tal_alpha: float = 1.0
     tal_beta: float = 6.0
+    center_sampling_radius: float = 0.5
     objectness_weight: float = 1.0
     match_weight: float = 1.0
     iou_weight: float = 7.5
@@ -70,6 +74,7 @@ class LossConfig:
     contrast_weight: float = 0.0
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
+    classification_margin: float = 0.2
 
 
 @dataclass

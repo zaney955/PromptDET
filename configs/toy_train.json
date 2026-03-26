@@ -9,7 +9,9 @@
     "reg_max": 16,
     "num_attention_heads": 8,
     "prompt_crop_size": 128,
-    "label_dropout": 0.4
+    "label_dropout": 0.4,
+    "logit_scale_init": 1.5,
+    "max_logit_scale": 2.5
   },
   "data": {
     "train_annotations": "./toy_data/train.json",
@@ -36,8 +38,9 @@
     "seed": 42,
     "mixed_precision": true,
     "grad_clip": 5.0,
-    "conf_threshold": 0.25,
+    "conf_threshold": 0.15,
     "nms_iou_threshold": 0.5,
+    "pre_nms_topk": 256,
     "max_det": 100,
     "eval_interval": 1,
     "save_interval": 1,
@@ -47,12 +50,14 @@
     "tal_topk": 9,
     "tal_alpha": 1.0,
     "tal_beta": 6.0,
+    "center_sampling_radius": 0.5,
     "objectness_weight": 1.0,
     "match_weight": 1.0,
     "iou_weight": 7.5,
     "dfl_weight": 1.5,
     "contrast_weight": 0.0,
     "focal_alpha": 0.25,
-    "focal_gamma": 2.0
+    "focal_gamma": 2.0,
+    "classification_margin": 0.2
   }
 }

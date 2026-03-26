@@ -16,6 +16,7 @@ def evaluate(
     device: torch.device,
     conf_threshold: float,
     nms_iou_threshold: float,
+    pre_nms_topk: int,
     max_det: int,
 ) -> Dict[str, float]:
     model.eval()
@@ -47,6 +48,7 @@ def evaluate(
             image_size=query_image.shape[-1],
             conf_threshold=conf_threshold,
             nms_iou_threshold=nms_iou_threshold,
+            pre_nms_topk=pre_nms_topk,
             max_det=max_det,
         )
         for pred, target in zip(preds, batch["targets"]):

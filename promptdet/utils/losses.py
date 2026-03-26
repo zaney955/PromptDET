@@ -21,10 +21,11 @@ class AssignmentResult:
 
 
 class PromptTaskAlignedAssigner:
-    def __init__(self, topk: int = 13, alpha: float = 1.0, beta: float = 6.0):
+    def __init__(self, topk: int = 13, alpha: float = 1.0, beta: float = 6.0, center_sampling_radius: float = 0.5):
         self.topk = topk
         self.alpha = alpha
         self.beta = beta
+        self.center_sampling_radius = center_sampling_radius
 
     def assign(
         self,
@@ -60,14 +61,21 @@ class PromptTaskAlignedAssigner:
                 & (anchor_points[:, 1] >= gt_box[1])
                 & (anchor_points[:, 1] <= gt_box[3])
             )
-            candidate_inds = torch.nonzero(inside, as_tuple=False).squeeze(1)
+            gt_center = (gt_box[:2] + gt_box[2:]) * 0.5
+            half_size = ((gt_box[2:] - gt_box[:2]) * 0.5).clamp(min=1.0)
+            center_delta = (anchor_points - gt_center).abs() / half_size
+            center_mask = center_delta.max(dim=1).values <= self.center_sampling_radius
+            candidate_inds = torch.nonzero(inside & center_mask, as_tuple=False).squeeze(1)
+            if candidate_inds.numel() == 0:
+                candidate_inds = torch.nonzero(inside, as_tuple=False).squeeze(1)
             if candidate_inds.numel() == 0:
                 continue
 
             candidate_boxes = pred_boxes[candidate_inds]
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
-            align = cls_scores.pow(self.alpha) * ious.pow(self.beta)
+            center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
+            align = cls_scores.pow(self.alpha) * ious.pow(self.beta) * center_prior
             topk = min(self.topk, candidate_inds.numel())
             top_align, top_pos = torch.topk(align, topk)
             selected = candidate_inds[top_pos]
@@ -124,11 +132,33 @@ def sigmoid_focal_loss(
     return loss
 
 
+def sigmoid_varifocal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+    gamma: float,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    prob = logits.sigmoid()
+    weight = alpha * prob.pow(gamma) * (1 - targets) + targets
+    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none") * weight
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "mean":
+        return loss.mean()
+    return loss
+
+
 class PromptDetectionLoss(torch.nn.Module):
     def __init__(self, reg_max: int, cfg: LossConfig):
         super().__init__()
         self.reg_max = reg_max
-        self.assigner = PromptTaskAlignedAssigner(cfg.tal_topk, cfg.tal_alpha, cfg.tal_beta)
+        self.assigner = PromptTaskAlignedAssigner(
+            cfg.tal_topk,
+            cfg.tal_alpha,
+            cfg.tal_beta,
+            cfg.center_sampling_radius,
+        )
         self.dfl = DFLoss(reg_max)
         self.cfg = cfg
 
@@ -169,10 +199,22 @@ class PromptDetectionLoss(torch.nn.Module):
                 valid_class_mask,
             )
 
-            total_match = total_match + pred_scores[batch_idx][:, valid_class_mask].sum() * 0.0
+            # Keep every head connected to the graph on every rank, even when a local batch
+            # contains no positives. This avoids DDP bucket rebuild errors.
+            total_iou = total_iou + pred_boxes[batch_idx].sum() * 0.0
             total_dfl = total_dfl + box_logits[batch_idx].sum() * 0.0
-            objectness_target = assign.fg_mask.float()
-            total_objectness = total_objectness + sigmoid_focal_loss(
+            valid_logits = pred_scores[batch_idx][:, valid_class_mask]
+            valid_targets = assign.target_scores[:, valid_class_mask]
+            total_match = total_match + sigmoid_varifocal_loss(
+                valid_logits,
+                valid_targets,
+                alpha=self.cfg.focal_alpha,
+                gamma=self.cfg.focal_gamma,
+                reduction="mean",
+            )
+
+            objectness_target = assign.target_scores.max(dim=-1).values
+            total_objectness = total_objectness + sigmoid_varifocal_loss(
                 pred_objectness[batch_idx],
                 objectness_target,
                 alpha=self.cfg.focal_alpha,
@@ -190,12 +232,16 @@ class PromptDetectionLoss(torch.nn.Module):
                 total_matched_iou_sum = total_matched_iou_sum + bbox_iou(pos_boxes, tgt_boxes).sum()
 
                 pos_labels = assign.matched_labels[assign.fg_mask]
-                pos_joint_scores = pred_obj[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]
+                pos_joint_scores = torch.sqrt((pred_obj[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]).clamp(min=0.0))
                 total_pos_score_sum = total_pos_score_sum + pos_joint_scores.sum()
 
                 cls_logits = pred_scores[batch_idx][assign.fg_mask]
                 cls_logits = cls_logits.masked_fill(~valid_class_mask.unsqueeze(0), -1e4)
-                total_match = total_match + F.cross_entropy(cls_logits, pos_labels, reduction="mean")
+                if self.cfg.classification_margin > 0:
+                    margin_logits = cls_logits.clone()
+                    margin_logits[torch.arange(pos_labels.shape[0], device=pos_labels.device), pos_labels] -= self.cfg.classification_margin
+                    cls_logits = margin_logits
+                total_match = total_match + 0.5 * F.cross_entropy(cls_logits, pos_labels, reduction="mean")
 
                 pos_logits = box_logits[batch_idx][assign.fg_mask]
                 tgt_dist = bbox2dist(anchor_points[assign.fg_mask], tgt_boxes, self.reg_max, stride_tensor[assign.fg_mask])
@@ -212,7 +258,7 @@ class PromptDetectionLoss(torch.nn.Module):
                 total_neg += neg_count
                 neg_scores = pred_prob[neg_mask][:, valid_class_mask]
                 if neg_scores.numel() > 0:
-                    neg_joint_scores = pred_obj[neg_mask] * neg_scores.max(dim=-1).values
+                    neg_joint_scores = torch.sqrt((pred_obj[neg_mask] * neg_scores.max(dim=-1).values).clamp(min=0.0))
                     total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
 
         num_batches = max(len(targets), 1)

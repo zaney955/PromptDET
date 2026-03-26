@@ -99,7 +99,8 @@ python detect.py \
   --prompt-box 62 57 125 120 \
   --prompt-label 0 \
   --query-image ./toy_data/images/val_00001.png \
-  --output-dir ./outputs/infer_demo
+  --output-dir ./outputs/infer_demo \
+  --conf-threshold 0.15
 ```
 
 Prompt-set mode:
@@ -110,7 +111,8 @@ python detect.py \
   --checkpoint ./outputs/exp1/best.pt \
   --prompt-spec ./toy_data/prompt_set.json \
   --query-image ./toy_data/images/val_00001.png \
-  --output-dir ./outputs/infer_prompt_set
+  --output-dir ./outputs/infer_prompt_set \
+  --conf-threshold 0.15
 ```
 
 `prompt_spec` format:

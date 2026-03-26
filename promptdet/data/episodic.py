@@ -62,6 +62,12 @@ class PromptEpisodeDataset(Dataset):
         self.class_to_image_ids: Dict[int, set[int]] = defaultdict(set)
         self.class_image_to_anns: Dict[int, Dict[int, List[dict]]] = defaultdict(lambda: defaultdict(list))
         self.categories = {item["id"]: item["name"] for item in payload["categories"]}
+        self.class_to_family: Dict[int, str] = {}
+        self.family_to_classes: Dict[str, set[int]] = defaultdict(set)
+        for category_id, category_name in self.categories.items():
+            family = category_name.split("_")[-1] if "_" in category_name else category_name
+            self.class_to_family[category_id] = family
+            self.family_to_classes[family].add(category_id)
         for ann in payload["annotations"]:
             bbox = ann["bbox"]
             if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
@@ -91,12 +97,13 @@ class PromptEpisodeDataset(Dataset):
         count = random.randint(min_classes, max_classes)
         return random.sample(self.classes, count)
 
-    def _sample_prompt_instances(self, prompt_class_ids: List[int]) -> List[dict]:
+    def _sample_prompt_instances(self, prompt_class_ids: List[int], class_to_slot: Dict[int, int]) -> List[dict]:
         selected_instances: List[dict] = []
         used_image_ids: set[int] = set()
         used_ann_ids: set[int] = set()
 
-        for class_slot, class_id in enumerate(prompt_class_ids):
+        for class_id in prompt_class_ids:
+            class_slot = class_to_slot[class_id]
             image_ids = list(self.class_to_image_ids[class_id])
             random.shuffle(image_ids)
             max_instances = min(
@@ -142,16 +149,37 @@ class PromptEpisodeDataset(Dataset):
             selected_instances.extend(class_instances)
         return selected_instances
 
+    def _get_confusable_classes(self, prompt_class_ids: List[int]) -> set[int]:
+        prompt_class_set = set(prompt_class_ids)
+        confusable = set()
+        for class_id in prompt_class_ids:
+            family = self.class_to_family.get(class_id)
+            if family is None:
+                continue
+            confusable.update(self.family_to_classes[family] - prompt_class_set)
+        return confusable
+
     def _sample_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> Tuple[int, bool]:
         prompt_class_set = set(prompt_class_ids)
         prompt_image_set = set(prompt_image_ids)
+        confusable_class_set = self._get_confusable_classes(prompt_class_ids)
         positive_ids = sorted(set().union(*(self.class_to_image_ids[class_id] for class_id in prompt_class_ids)))
         positive_ids = [image_id for image_id in positive_ids if image_id not in prompt_image_set] or positive_ids
+        confusable_positive_ids = [
+            image_id
+            for image_id in positive_ids
+            if self.image_to_class_ids[image_id] & confusable_class_set
+        ]
 
         negative_ids = [
             image_id
             for image_id in self.image_ids
             if not (self.image_to_class_ids[image_id] & prompt_class_set) and image_id not in prompt_image_set
+        ]
+        confusable_negative_ids = [
+            image_id
+            for image_id in negative_ids
+            if self.image_to_class_ids[image_id] & confusable_class_set
         ]
         hard_negative_ids = [
             image_id
@@ -160,12 +188,19 @@ class PromptEpisodeDataset(Dataset):
         ]
 
         sample = random.random()
-        if sample < self.hard_negative_ratio and hard_negative_ids:
-            return random.choice(hard_negative_ids), False
+        if sample < self.hard_negative_ratio:
+            if confusable_negative_ids:
+                return random.choice(confusable_negative_ids), False
+            if hard_negative_ids:
+                return random.choice(hard_negative_ids), False
         if sample < self.hard_negative_ratio + self.negative_ratio and negative_ids:
             return random.choice(negative_ids), False
         if positive_ids:
+            if confusable_positive_ids and random.random() < 0.5:
+                return random.choice(confusable_positive_ids), True
             return random.choice(positive_ids), True
+        if confusable_negative_ids:
+            return random.choice(confusable_negative_ids), False
         if hard_negative_ids:
             return random.choice(hard_negative_ids), False
         if negative_ids:
@@ -173,11 +208,19 @@ class PromptEpisodeDataset(Dataset):
         return random.choice(self.image_ids), False
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        prompt_class_ids = self._sample_prompt_classes()
-        class_to_slot = {class_id: idx for idx, class_id in enumerate(prompt_class_ids)}
-        prompt_instances = self._sample_prompt_instances(prompt_class_ids)
+        sampled_prompt_class_ids = self._sample_prompt_classes()
+        slot_order = random.sample(range(len(sampled_prompt_class_ids)), len(sampled_prompt_class_ids))
+        class_to_slot = {
+            class_id: slot_order[idx]
+            for idx, class_id in enumerate(sampled_prompt_class_ids)
+        }
+        prompt_class_ids = [-1] * len(sampled_prompt_class_ids)
+        for class_id, slot in class_to_slot.items():
+            prompt_class_ids[slot] = class_id
+
+        prompt_instances = self._sample_prompt_instances(sampled_prompt_class_ids, class_to_slot)
         prompt_image_ids = [instance["image_id"] for instance in prompt_instances]
-        query_image_id, positive = self._sample_query(prompt_class_ids, prompt_image_ids)
+        query_image_id, positive = self._sample_query(sampled_prompt_class_ids, prompt_image_ids)
 
         prompt_images = []
         prompt_boxes = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List
 
 import torch
@@ -7,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from promptdet.config import ModelConfig
-from promptdet.utils.box_ops import batched_nms, clamp_boxes, dist2bbox, make_anchors
+from promptdet.utils.box_ops import clamp_boxes, dist2bbox, make_anchors, nms
 
 from .backbone import PromptDetBackbone
 from .fusion import PromptFusionNeck
@@ -33,7 +34,7 @@ class PromptDET(nn.Module):
         self.fusion = PromptFusionNeck(cfg.neck_channels, cfg.prompt_dim, cfg.num_attention_heads)
         self.head = PromptDetectHead(cfg.neck_channels, cfg.reg_max, cfg.prompt_dim)
         self.register_buffer("proj_bins", torch.arange(cfg.reg_max, dtype=torch.float32), persistent=False)
-        self.logit_scale = nn.Parameter(torch.tensor(2.0))
+        self.logit_scale = nn.Parameter(torch.tensor(cfg.logit_scale_init))
 
     def forward(
         self,
@@ -69,7 +70,8 @@ class PromptDET(nn.Module):
         outputs = self.head(fused)
         outputs["class_prototypes"] = prompt["class_prototypes"]
         outputs["class_mask"] = prompt["class_mask"]
-        outputs["logit_scale"] = self.logit_scale.exp()
+        max_scale = math.exp(self.cfg.max_logit_scale)
+        outputs["logit_scale"] = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         return outputs
 
     def decode_raw(
@@ -141,6 +143,7 @@ class PromptDET(nn.Module):
         image_size: int,
         conf_threshold: float = 0.25,
         nms_iou_threshold: float = 0.5,
+        pre_nms_topk: int = 256,
         max_det: int = 100,
     ) -> List[Dict[str, torch.Tensor]]:
         decoded = self.decode_raw(outputs)
@@ -172,12 +175,17 @@ class PromptDET(nn.Module):
                 })
                 continue
             class_scores_max, class_index = valid_scores.max(dim=1)
-            scores = class_scores_max * pred_objectness[batch_idx]
+            scores = torch.sqrt((class_scores_max * pred_objectness[batch_idx]).clamp(min=0.0))
+            if scores.numel() > pre_nms_topk:
+                topk_scores, topk_idx = torch.topk(scores, k=pre_nms_topk)
+                boxes = boxes[topk_idx]
+                class_index = class_index[topk_idx]
+                scores = topk_scores
             keep = scores > conf_threshold
             boxes = clamp_boxes(boxes[keep], image_size, image_size)
             scores = scores[keep]
             labels = valid_class_ids[class_index[keep]]
-            keep_idx = batched_nms(boxes, scores, labels, nms_iou_threshold)
+            keep_idx = nms(boxes, scores, nms_iou_threshold)
             keep_idx = keep_idx[:max_det]
             results.append({
                 "boxes": boxes[keep_idx],
