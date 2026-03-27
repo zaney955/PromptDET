@@ -153,7 +153,6 @@ def train(
                 pre_nms_topk=config.train.pre_nms_topk,
                 one2one_topk=config.train.one2one_topk,
                 one2one_peak_kernel=config.train.one2one_peak_kernel,
-                class_margin_scale=config.train.class_margin_scale,
                 max_det=config.train.max_det,
             )
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})

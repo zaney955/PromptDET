@@ -48,7 +48,6 @@ class PromptEncoder(nn.Module):
         self.crop_size = crop_size
         self.label_dropout = label_dropout
         self.max_prompt_classes = max_prompt_classes
-        self.prompt_types = {name: idx for idx, name in enumerate(prompt_types)}
 
         self.crop_encoder = nn.Sequential(
             ConvBNAct(3, 48, 3, stride=2),

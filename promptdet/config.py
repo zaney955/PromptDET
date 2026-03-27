@@ -26,10 +26,11 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    train_annotations: str = ""
-    val_annotations: str = ""
-    images_dir: str = ""
-    category_map: str = ""
+    train_list: str = ""
+    val_list: str = ""
+    train_labels_dir: str = ""
+    val_labels_dir: str = ""
+    class_names_path: str = ""
     min_prompt_classes: int = 1
     max_prompt_classes: int = 3
     max_prompt_instances_per_class: int = 2
@@ -58,7 +59,6 @@ class TrainConfig:
     pre_nms_topk: int = 256
     one2one_topk: int = 300
     one2one_peak_kernel: int = 3
-    class_margin_scale: float = 6.0
     max_det: int = 100
     eval_interval: int = 1
     save_interval: int = 1

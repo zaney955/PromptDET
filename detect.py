@@ -9,6 +9,7 @@ import torch
 
 from promptdet.config import load_config
 from promptdet.models.promptdet import PromptDET
+from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 from promptdet.utils.checkpoint import load_checkpoint
 from promptdet.utils.visualize import save_detection_visualization
 
@@ -31,7 +32,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--prompt-spec", type=str, default=None, help="JSON file describing a prompt set.")
     parser.add_argument("--prompt-image", type=str, default=None)
-    parser.add_argument("--prompt-box", type=float, nargs=4, default=None, help="x1 y1 x2 y2 on the original prompt image")
+    parser.add_argument("--prompt-box", type=float, nargs=4, default=None, help="normalized x_center y_center width height on the original prompt image")
     parser.add_argument("--prompt-label", type=int, default=None)
     parser.add_argument("--query-image", type=str, required=True, help="Path to one query image or a directory of query images.")
     parser.add_argument("--output-dir", type=str, required=True)
@@ -41,7 +42,6 @@ def parse_args():
     parser.add_argument("--pre-nms-topk", type=int, default=None)
     parser.add_argument("--one2one-topk", type=int, default=None)
     parser.add_argument("--one2one-peak-kernel", type=int, default=None)
-    parser.add_argument("--class-margin-scale", type=float, default=None)
     parser.add_argument("--max-det", type=int, default=None)
     return parser.parse_args()
 
@@ -84,14 +84,16 @@ def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
             prompt_image_path = (prompt_spec_path.parent / prompt_image_path).resolve()
         prompt_image = Image.open(prompt_image_path).convert("RGB")
         resized = resize_image(prompt_image, image_size)
-        scale_x = image_size / prompt_image.size[0]
-        scale_y = image_size / prompt_image.size[1]
         for ann in prompt["annotations"]:
             label = int(ann["label"])
             slot = label_to_slot.setdefault(label, len(label_to_slot))
-            bbox = torch.tensor(ann["bbox"], dtype=torch.float32)
-            bbox[0::2] *= scale_x
-            bbox[1::2] *= scale_y
+            bbox = yolo_xywh_to_xyxy_tensor(
+                torch.tensor([ann["bbox"]], dtype=torch.float32),
+                prompt_image.size[0],
+                prompt_image.size[1],
+            )[0]
+            bbox[0::2] *= image_size / prompt_image.size[0]
+            bbox[1::2] *= image_size / prompt_image.size[1]
             prompt_images.append(resized)
             prompt_boxes.append(bbox)
             prompt_class_indices.append(slot)
@@ -127,7 +129,6 @@ def _run_single_query(
     pre_nms_topk: int,
     one2one_topk: int,
     one2one_peak_kernel: int,
-    class_margin_scale: float,
     max_det: int,
 ) -> tuple[Image.Image, dict[str, torch.Tensor]]:
     query_pil = Image.open(query_path).convert("RGB")
@@ -155,7 +156,6 @@ def _run_single_query(
             pre_nms_topk=pre_nms_topk,
             one2one_topk=one2one_topk,
             one2one_peak_kernel=one2one_peak_kernel,
-            class_margin_scale=class_margin_scale,
             max_det=max_det,
         )[0]
 
@@ -181,8 +181,6 @@ def main():
         config.train.one2one_topk = args.one2one_topk
     if args.one2one_peak_kernel is not None:
         config.train.one2one_peak_kernel = args.one2one_peak_kernel
-    if args.class_margin_scale is not None:
-        config.train.class_margin_scale = args.class_margin_scale
     if args.max_det is not None:
         config.train.max_det = args.max_det
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
@@ -213,7 +211,6 @@ def main():
             pre_nms_topk=config.train.pre_nms_topk,
             one2one_topk=config.train.one2one_topk,
             one2one_peak_kernel=config.train.one2one_peak_kernel,
-            class_margin_scale=config.train.class_margin_scale,
             max_det=config.train.max_det,
         )
         payload = {

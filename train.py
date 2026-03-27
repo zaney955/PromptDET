@@ -19,9 +19,11 @@ from promptdet.utils.misc import cleanup_distributed, is_main_process, set_seed,
 def parse_args():
     parser = argparse.ArgumentParser(description="Train PromptDET.")
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config.")
-    parser.add_argument("--train-annotations", type=str, default=None)
-    parser.add_argument("--val-annotations", type=str, default=None)
-    parser.add_argument("--images-dir", type=str, default=None)
+    parser.add_argument("--train-list", type=str, default=None)
+    parser.add_argument("--val-list", type=str, default=None)
+    parser.add_argument("--train-labels-dir", type=str, default=None)
+    parser.add_argument("--val-labels-dir", type=str, default=None)
+    parser.add_argument("--class-names", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None, help="Per-process batch size.")
@@ -33,12 +35,16 @@ def parse_args():
 def main():
     args = parse_args()
     config = load_config(args.config)
-    if args.train_annotations:
-        config.data.train_annotations = args.train_annotations
-    if args.val_annotations:
-        config.data.val_annotations = args.val_annotations
-    if args.images_dir:
-        config.data.images_dir = args.images_dir
+    if args.train_list:
+        config.data.train_list = args.train_list
+    if args.val_list:
+        config.data.val_list = args.val_list
+    if args.train_labels_dir:
+        config.data.train_labels_dir = args.train_labels_dir
+    if args.val_labels_dir:
+        config.data.val_labels_dir = args.val_labels_dir
+    if args.class_names:
+        config.data.class_names_path = args.class_names
     if args.output_dir:
         config.train.output_dir = args.output_dir
     if args.epochs is not None:
@@ -48,8 +54,14 @@ def main():
     if args.device:
         config.train.device = args.device
 
-    if not config.data.train_annotations or not config.data.val_annotations or not config.data.images_dir:
-        raise ValueError("train/val annotations and images_dir must be provided.")
+    if (
+        not config.data.train_list
+        or not config.data.val_list
+        or not config.data.train_labels_dir
+        or not config.data.val_labels_dir
+        or not config.data.class_names_path
+    ):
+        raise ValueError("train/val txt lists, label dirs, and class_names_path must be provided.")
     if config.data.max_prompt_classes > config.model.max_prompt_classes:
         raise ValueError("data.max_prompt_classes cannot exceed model.max_prompt_classes.")
 
@@ -67,8 +79,9 @@ def main():
         save_config(output_dir / "config.json", config)
 
     train_dataset = PromptEpisodeDataset(
-        annotations_path=config.data.train_annotations,
-        images_dir=config.data.images_dir,
+        image_list_path=config.data.train_list,
+        labels_dir=config.data.train_labels_dir,
+        class_names_path=config.data.class_names_path,
         image_size=config.model.image_size,
         episodes_per_epoch=config.data.episodes_per_epoch,
         negative_ratio=config.data.negative_ratio,
@@ -80,8 +93,9 @@ def main():
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
     )
     val_dataset = PromptEpisodeDataset(
-        annotations_path=config.data.val_annotations,
-        images_dir=config.data.images_dir,
+        image_list_path=config.data.val_list,
+        labels_dir=config.data.val_labels_dir,
+        class_names_path=config.data.class_names_path,
         image_size=config.model.image_size,
         episodes_per_epoch=config.data.val_episodes,
         negative_ratio=config.data.negative_ratio,

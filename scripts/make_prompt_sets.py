@@ -6,10 +6,13 @@ import json
 import os
 import random
 from pathlib import Path
+import sys
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+from promptdet.data.yolo_io import load_class_names, load_image_list, parse_yolo_label_file
 
 
 def _select_annotations_for_labels(anns: list[dict], labels: list[int], rng: random.Random) -> list[dict]:
@@ -26,8 +29,43 @@ def _select_annotations_for_labels(anns: list[dict], labels: list[int], rng: ran
     return selected
 
 
+def _load_split_records(
+    images_list_path: Path,
+    labels_dir: Path,
+    class_names_path: Path,
+) -> tuple[dict[int, dict], dict[int, list[dict]], dict[int, set[int]], dict[int, dict[int, list[dict]]], dict[int, str]]:
+    image_by_id: dict[int, dict] = {}
+    anns_by_image: dict[int, list[dict]] = defaultdict(list)
+    class_to_image_ids: dict[int, set[int]] = defaultdict(set)
+    class_image_to_anns: dict[int, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    category_by_id = load_class_names(class_names_path)
+
+    for image_id, image_path in enumerate(load_image_list(images_list_path)):
+        image_by_id[image_id] = {
+            "id": image_id,
+            "file_name": image_path.name,
+            "path": image_path,
+        }
+        label_path = labels_dir / f"{image_path.stem}.txt"
+        for category_id, bbox in parse_yolo_label_file(label_path):
+            if category_id not in category_by_id:
+                continue
+            ann = {
+                "image_id": image_id,
+                "category_id": category_id,
+                "bbox": bbox,
+            }
+            anns_by_image[image_id].append(ann)
+            class_to_image_ids[category_id].add(image_id)
+            class_image_to_anns[category_id][image_id].append(ann)
+
+    return image_by_id, anns_by_image, class_to_image_ids, class_image_to_anns, category_by_id
+
+
 def build_prompt_sets(
-    annotations_path: Path,
+    images_list_path: Path,
+    labels_dir: Path,
+    class_names_path: Path,
     output_dir: Path,
     num_sets: int,
     min_prompt_classes: int,
@@ -35,19 +73,12 @@ def build_prompt_sets(
     max_extra_prompt_images: int,
     seed: int,
 ) -> list[dict]:
-    payload = _load_json(annotations_path)
     rng = random.Random(seed)
-
-    image_by_id = {item["id"]: item for item in payload["images"]}
-    category_by_id = {item["id"]: item["name"] for item in payload["categories"]}
-    anns_by_image: dict[int, list[dict]] = defaultdict(list)
-    class_to_image_ids: dict[int, set[int]] = defaultdict(set)
-    class_image_to_anns: dict[int, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
-
-    for ann in payload["annotations"]:
-        anns_by_image[ann["image_id"]].append(ann)
-        class_to_image_ids[ann["category_id"]].add(ann["image_id"])
-        class_image_to_anns[ann["category_id"]][ann["image_id"]].append(ann)
+    image_by_id, anns_by_image, class_to_image_ids, class_image_to_anns, category_by_id = _load_split_records(
+        images_list_path=images_list_path,
+        labels_dir=labels_dir,
+        class_names_path=class_names_path,
+    )
 
     candidate_image_ids = [
         image_id
@@ -61,9 +92,6 @@ def build_prompt_sets(
     selected_image_ids = candidate_image_ids[:num_sets]
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    images_dir = annotations_path.parent / "images"
-    relative_images_dir = Path(os.path.relpath(images_dir, output_dir))
-
     manifest = []
     for prompt_idx, image_id in enumerate(selected_image_ids):
         anns = anns_by_image[image_id]
@@ -73,7 +101,7 @@ def build_prompt_sets(
         selected_labels = sorted(rng.sample(available_labels, prompt_class_count))
 
         prompts = [{
-            "image": str(relative_images_dir / image_by_id[image_id]["file_name"]),
+            "image": os.path.relpath(image_by_id[image_id]["path"], output_dir),
             "annotations": _select_annotations_for_labels(anns, selected_labels, rng),
         }]
         used_image_ids = {image_id}
@@ -89,7 +117,7 @@ def build_prompt_sets(
             alt_image_id = rng.choice(alternative_image_ids)
             alt_ann = rng.choice(class_image_to_anns[label][alt_image_id])
             prompts.append({
-                "image": str(relative_images_dir / image_by_id[alt_image_id]["file_name"]),
+                "image": os.path.relpath(image_by_id[alt_image_id]["path"], output_dir),
                 "annotations": [{
                     "bbox": alt_ann["bbox"],
                     "label": alt_ann["category_id"],
@@ -109,7 +137,9 @@ def build_prompt_sets(
         })
 
     index_payload = {
-        "annotations": str(annotations_path),
+        "images_list": str(images_list_path),
+        "labels_dir": str(labels_dir),
+        "class_names_path": str(class_names_path),
         "generated": len(manifest),
         "items": manifest,
     }
@@ -118,8 +148,10 @@ def build_prompt_sets(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate multiple prompt_set JSON files from a labeled split.")
-    parser.add_argument("--annotations", type=str, required=True, help="COCO-like annotations JSON, e.g. ./toy_data/val.json")
+    parser = argparse.ArgumentParser(description="Generate multiple prompt_set JSON files from a YOLO-style labeled split.")
+    parser.add_argument("--images-list", type=str, required=True, help="Split list txt, e.g. ./toy_data/val.txt")
+    parser.add_argument("--labels-dir", type=str, required=True, help="Label directory, e.g. ./toy_data/labels/val")
+    parser.add_argument("--class-names", type=str, required=True, help="Class names txt, e.g. ./toy_data/classes.txt")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to write prompt_set_XXX.json files into")
     parser.add_argument("--num-sets", type=int, default=24)
     parser.add_argument("--min-prompt-classes", type=int, default=2)
@@ -132,7 +164,9 @@ def parse_args():
 def main():
     args = parse_args()
     manifest = build_prompt_sets(
-        annotations_path=Path(args.annotations),
+        images_list_path=Path(args.images_list),
+        labels_dir=Path(args.labels_dir),
+        class_names_path=Path(args.class_names),
         output_dir=Path(args.output_dir),
         num_sets=args.num_sets,
         min_prompt_classes=args.min_prompt_classes,

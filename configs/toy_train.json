@@ -15,9 +15,11 @@
     "detail_score_weight": 0.5
   },
   "data": {
-    "train_annotations": "./toy_data/train.json",
-    "val_annotations": "./toy_data/val.json",
-    "images_dir": "./toy_data/images",
+    "train_list": "./toy_data/train.txt",
+    "val_list": "./toy_data/val.txt",
+    "train_labels_dir": "./toy_data/labels/train",
+    "val_labels_dir": "./toy_data/labels/val",
+    "class_names_path": "./toy_data/classes.txt",
     "min_prompt_classes": 1,
     "max_prompt_classes": 3,
     "max_prompt_instances_per_class": 2,
@@ -44,7 +46,6 @@
     "pre_nms_topk": 256,
     "one2one_topk": 300,
     "one2one_peak_kernel": 3,
-    "class_margin_scale": 6.0,
     "max_det": 100,
     "eval_interval": 1,
     "save_interval": 1,

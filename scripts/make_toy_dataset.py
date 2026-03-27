@@ -5,8 +5,15 @@ from collections import defaultdict
 import json
 import random
 from pathlib import Path
+import sys
 
 from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from promptdet.utils.box_formats import xyxy_to_yolo_xywh
 
 
 CLASSES = [
@@ -47,43 +54,82 @@ def sample_bbox(image_size: int, min_size: int = 28, max_size: int = 96):
     return [x1, y1, x1 + size, y1 + size]
 
 
-def build_split(output_dir: Path, split: str, num_images: int, image_size: int):
-    images_dir = output_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"images": [], "annotations": [], "categories": []}
-    for idx, (name, _, _) in enumerate(CLASSES):
-        payload["categories"].append({"id": idx, "name": name})
+def _round_bbox(bbox: list[float]) -> list[float]:
+    return [round(float(value), 6) for value in bbox]
 
-    ann_id = 0
+
+def _write_split_list(output_dir: Path, split: str, file_names: list[str]) -> None:
+    list_rows = [f"./images/{file_name}" for file_name in file_names]
+    (output_dir / f"{split}.txt").write_text("\n".join(list_rows) + "\n", encoding="utf-8")
+
+
+def _write_classes_file(output_dir: Path) -> None:
+    (output_dir / "classes.txt").write_text(
+        "\n".join(name for name, _, _ in CLASSES) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_dataset_yaml(output_dir: Path) -> None:
+    names_rows = [f"  {idx}: {name}" for idx, (name, _, _) in enumerate(CLASSES)]
+    payload = [
+        "path: .",
+        "train: train.txt",
+        "val: val.txt",
+        "names:",
+        *names_rows,
+        "",
+    ]
+    (output_dir / "dataset.yaml").write_text("\n".join(payload), encoding="utf-8")
+
+
+def build_split(output_dir: Path, split: str, num_images: int, image_size: int) -> list[dict]:
+    images_dir = output_dir / "images"
+    labels_dir = output_dir / "labels" / split
+    images_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
+
+    records: list[dict] = []
+    file_names: list[str] = []
     for image_id in range(num_images):
         image = Image.new("RGB", (image_size, image_size), color=(248, 248, 248))
         draw = ImageDraw.Draw(image)
         num_objects = random.randint(2, 6)
+        label_rows = []
+        annotations = []
         for _ in range(num_objects):
             category_id = random.randint(0, len(CLASSES) - 1)
             _, color, shape = CLASSES[category_id]
-            bbox = sample_bbox(image_size)
-            draw_shape(draw, bbox, color, shape)
-            payload["annotations"].append({
-                "id": ann_id,
-                "image_id": image_id,
+            bbox_xyxy = sample_bbox(image_size)
+            draw_shape(draw, bbox_xyxy, color, shape)
+            bbox_yolo = _round_bbox(xyxy_to_yolo_xywh(bbox_xyxy, image_size, image_size))
+            annotations.append({
                 "category_id": category_id,
-                "bbox": bbox,
+                "bbox": bbox_yolo,
             })
-            ann_id += 1
+            label_rows.append(
+                f"{category_id} "
+                f"{bbox_yolo[0]:.6f} {bbox_yolo[1]:.6f} {bbox_yolo[2]:.6f} {bbox_yolo[3]:.6f}"
+            )
         file_name = f"{split}_{image_id:05d}.png"
         image.save(images_dir / file_name)
-        payload["images"].append({"id": image_id, "file_name": file_name, "width": image_size, "height": image_size})
+        (labels_dir / f"{Path(file_name).stem}.txt").write_text("\n".join(label_rows) + "\n", encoding="utf-8")
+        file_names.append(file_name)
+        records.append({
+            "id": image_id,
+            "file_name": file_name,
+            "image": f"./images/{file_name}",
+            "annotations": annotations,
+        })
 
-    (output_dir / f"{split}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+    _write_split_list(output_dir, split, file_names)
+    return records
 
 
-def build_prompt_spec(output_dir: Path, train_payload: dict):
-    image_by_id = {item["id"]: item for item in train_payload["images"]}
+def build_prompt_spec(output_dir: Path, train_records: list[dict]):
     anns_by_image = defaultdict(list)
-    for ann in train_payload["annotations"]:
-        anns_by_image[ann["image_id"]].append(ann)
+    for record in train_records:
+        anns_by_image[record["id"]].extend(record["annotations"])
 
     image_ids = sorted(anns_by_image.keys())
     if not image_ids:
@@ -96,6 +142,7 @@ def build_prompt_spec(output_dir: Path, train_payload: dict):
             primary_image_id = image_id
             break
 
+    record_by_id = {record["id"]: record for record in train_records}
     selected_annotations = []
     selected_labels = []
     seen_labels = set()
@@ -112,7 +159,7 @@ def build_prompt_spec(output_dir: Path, train_payload: dict):
             break
 
     prompts = [{
-        "image": f"./images/{image_by_id[primary_image_id]['file_name']}",
+        "image": record_by_id[primary_image_id]["image"],
         "annotations": selected_annotations,
     }]
 
@@ -124,7 +171,7 @@ def build_prompt_spec(output_dir: Path, train_payload: dict):
             match = next((ann for ann in anns_by_image[image_id] if ann["category_id"] == label), None)
             if match is not None:
                 found = {
-                    "image": f"./images/{image_by_id[image_id]['file_name']}",
+                    "image": record_by_id[image_id]["image"],
                     "annotations": [{
                         "bbox": match["bbox"],
                         "label": match["category_id"],
@@ -158,9 +205,11 @@ def main():
     random.seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_payload = build_split(output_dir, "train", args.train_images, args.image_size)
+    _write_classes_file(output_dir)
+    _write_dataset_yaml(output_dir)
+    train_records = build_split(output_dir, "train", args.train_images, args.image_size)
     build_split(output_dir, "val", args.val_images, args.image_size)
-    build_prompt_spec(output_dir, train_payload)
+    build_prompt_spec(output_dir, train_records)
     print(f"Toy dataset generated at {output_dir}")
 
 

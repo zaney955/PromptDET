@@ -1,12 +1,12 @@
 # PromptDET
 
-PromptDET is a prompt-conditioned detector built from scratch for the workflow:
+PromptDET is a prompt-conditioned detector built for the workflow:
 
 - prompt set of one or more annotated images
 - one or more selected categories defined by prompt examples
 - query image
 
-The model predicts all query boxes that belong to the categories dynamically defined by the prompt set.
+The model predicts only the query boxes that belong to the categories dynamically defined by the prompt set.
 Prompt labels are episode-local identity tokens used to group prompt instances into classes for that episode. They are not natural-language semantics and should not be treated as globally meaningful category embeddings.
 
 The implementation combines:
@@ -49,9 +49,14 @@ python scripts/make_toy_dataset.py --output-dir ./toy_data
 
 This creates:
 
-- `./toy_data/train.json`
-- `./toy_data/val.json`
+- `./toy_data/train.txt`
+- `./toy_data/val.txt`
+- `./toy_data/classes.txt`
+- `./toy_data/dataset.yaml`
 - `./toy_data/images/*.png`
+- `./toy_data/labels/train/*.txt`
+- `./toy_data/labels/val/*.txt`
+- `./toy_data/prompt_set.json`
 
 ## Train
 
@@ -71,14 +76,16 @@ To suppress the `OMP_NUM_THREADS` warning from `torchrun`, set it explicitly:
 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 train.py --config configs/toy_train.json --device cuda
 ```
 
-You can override any important path from the CLI:
+You can override the dataset paths from the CLI:
 
 ```bash
 python train.py \
   --config configs/toy_train.json \
-  --train-annotations ./toy_data/train.json \
-  --val-annotations ./toy_data/val.json \
-  --images-dir ./toy_data/images \
+  --train-list ./toy_data/train.txt \
+  --val-list ./toy_data/val.txt \
+  --train-labels-dir ./toy_data/labels/train \
+  --val-labels-dir ./toy_data/labels/val \
+  --class-names ./toy_data/classes.txt \
   --output-dir ./outputs/exp1 \
   --device cuda
 ```
@@ -102,7 +109,7 @@ python detect.py \
   --config ./outputs/exp1/config.json \
   --checkpoint ./outputs/exp1/best.pt \
   --prompt-image ./toy_data/images/train_00000.png \
-  --prompt-box 62 57 125 120 \
+  --prompt-box 0.365234 0.345703 0.246094 0.246094 \
   --prompt-label 0 \
   --query-image ./toy_data/images/val_00001.png \
   --output-dir ./outputs/infer_demo \
@@ -143,23 +150,21 @@ When `--query-image` points to a directory, each image is written to its own sub
     {
       "image": "./images/train_00000.png",
       "annotations": [
-        {"bbox": [62, 57, 125, 120], "label": 0},
-        {"bbox": [173, 189, 214, 230], "label": 2}
+        {"bbox": [0.365234, 0.345703, 0.246094, 0.246094], "label": 0},
+        {"bbox": [0.755859, 0.818359, 0.160156, 0.160156], "label": 2}
       ]
     },
     {
       "image": "./images/train_00007.png",
       "annotations": [
-        {"bbox": [68, 87, 164, 183], "label": 1}
+        {"bbox": [0.453125, 0.527344, 0.375000, 0.375000], "label": 1}
       ]
     }
   ]
 }
 ```
 
-When `prompt_set.json` lives inside `toy_data/`, image paths are resolved relative to that JSON file. The `label` field is the dataset `category_id` from `train.json`, not a free-form class name.
-For the toy dataset, this keeps `prompt_set.json` consistent with `train.json`.
-Conceptually, `label` is just the identity token used to indicate which prompt annotations belong to the same prompt-defined class within that episode.
+When `prompt_set.json` lives inside `toy_data/`, image paths are resolved relative to that JSON file. The `label` field uses the class id defined by line order in `classes.txt`, not a free-form class name. Conceptually, `label` is just the identity token used to indicate which prompt annotations belong to the same prompt-defined class within that episode.
 
 You can validate the generated toy dataset and prompt spec with:
 
@@ -210,14 +215,11 @@ Not yet implemented:
 
 ## Dataset Format
 
-The project expects a COCO-like JSON with:
+The project now uses a YOLO-style dataset layout:
 
-```json
-{
-  "images": [{"id": 0, "file_name": "xxx.png", "width": 256, "height": 256}],
-  "annotations": [{"id": 0, "image_id": 0, "category_id": 1, "bbox": [x1, y1, x2, y2]}],
-  "categories": [{"id": 1, "name": "class_name"}]
-}
-```
+- `train.txt` / `val.txt`: one image path per line
+- `labels/<split>/<stem>.txt`: one object per line in `class x_center y_center width height`
+- `classes.txt`: one class name per line
+- `prompt_set.json`: prompt annotations using the same normalized `xywh` format
 
-Bounding boxes use absolute `xyxy` pixel coordinates.
+All four box values are normalized to `0~1` relative to image width and height.

@@ -60,9 +60,9 @@
 - `nms_iou_threshold` may exist for compatibility, but NMS is not part of the intended final architecture.
 
 ## Data and Toy Dataset
-- `toy_data` labels must stay consistent with the generated `train.json` and `prompt_set.json`.
+- `toy_data` labels must stay consistent with the generated `train.txt`, `val.txt`, `classes.txt`, and `prompt_set.json`.
 - If modifying toy data generation, also update its consistency checks.
-- Example prompt specs must be derived from real annotations, never hand-waved placeholders.
+- Example prompt specs must be derived from real label files, never hand-waved placeholders.
 
 ## Engineering Expectations
 - Favor changes that improve identifiability, calibration, and prompt-conditioned generalization over cosmetic fixes.

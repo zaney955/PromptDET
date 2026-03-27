@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-import json
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -10,6 +9,9 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+
+from promptdet.data.yolo_io import load_class_names, load_image_list, parse_yolo_label_file
+from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 
 
 def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
@@ -27,11 +29,23 @@ def resize_image_and_boxes(image: Image.Image, boxes: torch.Tensor, size: int) -
     return _pil_to_tensor(resized), boxes
 
 
+def _yolo_box_valid(box: list[float]) -> bool:
+    if len(box) != 4:
+        return False
+    cx, cy, w, h = [float(v) for v in box]
+    if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0):
+        return False
+    if not (0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+        return False
+    return True
+
+
 class PromptEpisodeDataset(Dataset):
     def __init__(
         self,
-        annotations_path: str,
-        images_dir: str,
+        image_list_path: str,
+        labels_dir: str,
+        class_names_path: str,
         image_size: int,
         episodes_per_epoch: int,
         negative_ratio: float = 0.35,
@@ -44,26 +58,24 @@ class PromptEpisodeDataset(Dataset):
         confusable_non_target_weight: float = 2.0,
     ):
         super().__init__()
-        payload = json.loads(Path(annotations_path).read_text(encoding="utf-8"))
-        self.images_dir = Path(images_dir)
+        self.labels_dir = Path(labels_dir)
         self.image_size = image_size
         self.episodes_per_epoch = episodes_per_epoch
         self.negative_ratio = negative_ratio
         self.hard_negative_ratio = hard_negative_ratio
-        self.prompt_type = prompt_type
         self.min_prompt_classes = min_prompt_classes
         self.max_prompt_classes = max_prompt_classes
         self.max_prompt_instances_per_class = max_prompt_instances_per_class
         self.max_prompt_images = max_prompt_images
         self.confusable_non_target_weight = confusable_non_target_weight
 
-        self.image_records = {item["id"]: item for item in payload["images"]}
+        self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
         self.image_to_class_ids: Dict[int, set[int]] = defaultdict(set)
         self.class_to_anns: Dict[int, List[dict]] = defaultdict(list)
         self.class_to_image_ids: Dict[int, set[int]] = defaultdict(set)
         self.class_image_to_anns: Dict[int, Dict[int, List[dict]]] = defaultdict(lambda: defaultdict(list))
-        self.categories = {item["id"]: item["name"] for item in payload["categories"]}
+        self.categories = load_class_names(class_names_path)
         self.class_to_family: Dict[int, str] = {}
         self.family_to_classes: Dict[str, set[int]] = defaultdict(set)
         self.family_confusions: Dict[str, set[str]] = {
@@ -74,27 +86,47 @@ class PromptEpisodeDataset(Dataset):
             family = category_name.split("_")[-1] if "_" in category_name else category_name
             self.class_to_family[category_id] = family
             self.family_to_classes[family].add(category_id)
-        for ann in payload["annotations"]:
-            bbox = ann["bbox"]
-            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-                continue
-            image_id = ann["image_id"]
-            category_id = ann["category_id"]
-            self.image_to_anns[image_id].append(ann)
-            self.image_to_class_ids[image_id].add(category_id)
-            self.class_to_anns[category_id].append(ann)
-            self.class_to_image_ids[category_id].add(image_id)
-            self.class_image_to_anns[category_id][image_id].append(ann)
+        ann_id = 0
+        for image_id, image_path in enumerate(load_image_list(image_list_path)):
+            with Image.open(image_path) as image:
+                image_w, image_h = image.size
+            self.image_records[image_id] = {
+                "id": image_id,
+                "file_name": image_path.name,
+                "path": str(image_path),
+                "width": image_w,
+                "height": image_h,
+            }
+            label_path = self.labels_dir / f"{image_path.stem}.txt"
+            for category_id, bbox in parse_yolo_label_file(label_path):
+                if category_id not in self.categories or not _yolo_box_valid(bbox):
+                    continue
+                bbox_xyxy = yolo_xywh_to_xyxy_tensor(
+                    torch.tensor([bbox], dtype=torch.float32),
+                    image_w,
+                    image_h,
+                )[0].tolist()
+                ann_record = {
+                    "id": ann_id,
+                    "image_id": image_id,
+                    "category_id": category_id,
+                    "bbox": bbox_xyxy,
+                }
+                ann_id += 1
+                self.image_to_anns[image_id].append(ann_record)
+                self.image_to_class_ids[image_id].add(category_id)
+                self.class_to_anns[category_id].append(ann_record)
+                self.class_to_image_ids[category_id].add(image_id)
+                self.class_image_to_anns[category_id][image_id].append(ann_record)
 
         self.image_ids = sorted(self.image_records.keys())
         self.classes = sorted(self.class_to_anns.keys())
-        self.non_empty_image_ids = [image_id for image_id in self.image_ids if self.image_to_anns[image_id]]
 
     def __len__(self) -> int:
         return self.episodes_per_epoch
 
     def _load_image(self, image_id: int) -> Image.Image:
-        path = self.images_dir / self.image_records[image_id]["file_name"]
+        path = Path(self.image_records[image_id]["path"])
         return Image.open(path).convert("RGB")
 
     def _sample_prompt_classes(self) -> List[int]:
