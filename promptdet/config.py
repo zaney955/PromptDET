@@ -76,6 +76,7 @@ class LossConfig:
     one2one_duplicate_radius: float = 1.25
     non_target_center_sampling_radius: float = 0.75
     objectness_weight: float = 1.0
+    targetness_weight: float = 1.0
     match_weight: float = 1.0
     iou_weight: float = 7.5
     dfl_weight: float = 1.5

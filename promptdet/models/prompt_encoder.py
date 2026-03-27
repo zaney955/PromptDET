@@ -24,6 +24,22 @@ def crop_and_resize(images: torch.Tensor, boxes: torch.Tensor, size: int) -> tor
     return torch.stack(crops, dim=0)
 
 
+def roi_pool_feature_mean(feats: torch.Tensor, boxes: torch.Tensor, image_h: int, image_w: int) -> torch.Tensor:
+    pooled = []
+    _, _, feat_h, feat_w = feats.shape
+    scale_x = feat_w / max(image_w, 1)
+    scale_y = feat_h / max(image_h, 1)
+    for feat, box in zip(feats, boxes):
+        x1, y1, x2, y2 = box.tolist()
+        fx1 = int(max(0, min(round(x1 * scale_x), feat_w - 1)))
+        fy1 = int(max(0, min(round(y1 * scale_y), feat_h - 1)))
+        fx2 = int(max(fx1 + 1, min(round(x2 * scale_x), feat_w)))
+        fy2 = int(max(fy1 + 1, min(round(y2 * scale_y), feat_h)))
+        roi = feat[:, fy1:fy2, fx1:fx2].unsqueeze(0)
+        pooled.append(F.adaptive_avg_pool2d(roi, output_size=1).flatten(1).squeeze(0))
+    return torch.stack(pooled, dim=0)
+
+
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
     weights = mask.float()
     while weights.dim() < values.dim():
@@ -94,7 +110,12 @@ class PromptEncoder(nn.Module):
         local_tokens = local_tokens.view(batch_size, num_instances, token_count, -1)
 
         crop_global = crop_feat.mean(dim=(2, 3)).view(batch_size, num_instances, -1)
-        support_global = prompt_feats["p5"].mean(dim=(3, 4))
+        roi_globals = []
+        flat_prompt_boxes = prompt_boxes.reshape(batch_size * num_instances, 4)
+        for name in ("p3", "p4", "p5"):
+            flat_feat = prompt_feats[name].reshape(batch_size * num_instances, *prompt_feats[name].shape[2:])
+            roi_globals.append(roi_pool_feature_mean(flat_feat, flat_prompt_boxes, image_h, image_w))
+        support_global = torch.stack(roi_globals, dim=0).mean(dim=0).view(batch_size, num_instances, -1)
 
         box_norm = prompt_boxes.clone()
         box_norm[:, :, 0::2] /= max(image_w, 1)

@@ -184,7 +184,7 @@ The intended prediction path is:
 
 - decode `one2one`
 - apply local peak filtering
-- combine objectness and prompt-class confidence into a quality-aware score
+- combine objectness, prompt-conditioned targetness, and prompt-class confidence into a quality-aware score
 - threshold
 - top-k
 
@@ -197,8 +197,9 @@ Implemented:
 - full modular prompt-conditioned detector with prompt-set episodes
 - shared backbone and PAN/FPN neck
 - prompt crop encoder with multi-instance class prototype aggregation
-- cross-attention prompt/query fusion
+- cross-attention prompt/query fusion with null-aware gating
 - dual-branch dense detection head with DFL regression
+- prompt-conditioned targetness prediction
 - dynamic prompt-class assignment
 - `one2one` unique matching with duplicate suppression supervision
 - local peak filtering for NMS-free `one2one` inference

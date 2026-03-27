@@ -98,6 +98,7 @@ class PromptTaskAlignedAssigner:
         pred_scores: torch.Tensor,
         pred_boxes: torch.Tensor,
         pred_objectness: torch.Tensor,
+        pred_targetness: torch.Tensor,
         anchor_points: torch.Tensor,
         gt_boxes: torch.Tensor,
         gt_labels: torch.Tensor,
@@ -124,6 +125,7 @@ class PromptTaskAlignedAssigner:
         assignment_metric = torch.full((num_points,), -1.0, device=device)
         overlaps = torch.zeros(num_points, device=device)
         pred_obj = pred_objectness.sigmoid()
+        pred_tgt = pred_targetness.sigmoid()
 
         for gt_idx, gt_box in enumerate(gt_boxes):
             class_idx = int(gt_labels[gt_idx].item())
@@ -150,7 +152,7 @@ class PromptTaskAlignedAssigner:
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
-            quality = torch.sqrt((pred_obj[candidate_inds] * cls_scores).clamp(min=0.0))
+            quality = (pred_obj[candidate_inds] * pred_tgt[candidate_inds] * cls_scores).clamp(min=0.0).pow(1.0 / 3.0)
             align = quality.pow(self.alpha) * ious.pow(self.beta) * center_prior
 
             topk = min(self.topk, candidate_inds.numel())
@@ -196,6 +198,7 @@ class PromptOneToOneAssigner:
         pred_scores: torch.Tensor,
         pred_boxes: torch.Tensor,
         pred_objectness: torch.Tensor,
+        pred_targetness: torch.Tensor,
         anchor_points: torch.Tensor,
         gt_boxes: torch.Tensor,
         gt_labels: torch.Tensor,
@@ -214,6 +217,7 @@ class PromptOneToOneAssigner:
             return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels, duplicate_mask)
 
         pred_obj = pred_objectness.sigmoid()
+        pred_tgt = pred_targetness.sigmoid()
         duplicate_candidates: Dict[int, torch.Tensor] = {}
         pair_candidates: List[tuple[float, int, int]] = []
         for gt_idx, gt_box in enumerate(gt_boxes):
@@ -240,7 +244,7 @@ class PromptOneToOneAssigner:
             candidate_boxes = pred_boxes[candidate_inds]
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
-            quality = torch.sqrt((pred_obj[candidate_inds] * cls_scores).clamp(min=0.0))
+            quality = (pred_obj[candidate_inds] * pred_tgt[candidate_inds] * cls_scores).clamp(min=0.0).pow(1.0 / 3.0)
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
             metric = quality * ious.pow(2) * center_prior.pow(2)
             top_limit = min(candidate_inds.numel(), self.candidate_topk)
@@ -318,12 +322,14 @@ class PromptDetectionLoss(torch.nn.Module):
         pred_boxes = outputs["pred_boxes"]
         pred_scores = outputs["pred_scores"]
         pred_objectness = outputs["pred_objectness"]
+        pred_targetness = outputs["pred_targetness"]
         anchor_points = outputs["anchor_points"]
         stride_tensor = outputs["stride_tensor"]
         box_logits = outputs["box_distribution"]
         class_mask = outputs["class_mask"]
 
         total_objectness = pred_scores.new_tensor(0.0)
+        total_targetness = pred_scores.new_tensor(0.0)
         total_match = pred_scores.new_tensor(0.0)
         total_iou = pred_scores.new_tensor(0.0)
         total_dfl = pred_scores.new_tensor(0.0)
@@ -345,6 +351,7 @@ class PromptDetectionLoss(torch.nn.Module):
                 pred_scores[batch_idx],
                 pred_boxes[batch_idx],
                 pred_objectness[batch_idx],
+                pred_targetness[batch_idx],
                 anchor_points,
                 gt_boxes,
                 gt_labels,
@@ -372,9 +379,17 @@ class PromptDetectionLoss(torch.nn.Module):
                 gamma=self.cfg.focal_gamma,
                 reduction="mean",
             )
+            total_targetness = total_targetness + sigmoid_varifocal_loss(
+                pred_targetness[batch_idx],
+                objectness_target,
+                alpha=self.cfg.focal_alpha,
+                gamma=self.cfg.focal_gamma,
+                reduction="mean",
+            )
 
             pred_prob = pred_scores[batch_idx].sigmoid()
             pred_obj = pred_objectness[batch_idx].sigmoid()
+            pred_tgt = pred_targetness[batch_idx].sigmoid()
             if assign.fg_mask.any():
                 pos_boxes = pred_boxes[batch_idx][assign.fg_mask]
                 tgt_boxes = assign.target_boxes[assign.fg_mask]
@@ -384,7 +399,7 @@ class PromptDetectionLoss(torch.nn.Module):
 
                 pos_labels = assign.matched_labels[assign.fg_mask]
                 pos_joint_scores = torch.sqrt(
-                    (pred_obj[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]).clamp(min=0.0)
+                    (pred_obj[assign.fg_mask] * pred_tgt[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]).clamp(min=0.0)
                 )
                 total_pos_score_sum = total_pos_score_sum + pos_joint_scores.sum()
 
@@ -418,6 +433,14 @@ class PromptDetectionLoss(torch.nn.Module):
                 dup_targets = torch.zeros_like(dup_logits)
                 total_objectness = total_objectness + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
                     dup_logits,
+                    dup_targets,
+                    alpha=self.cfg.focal_alpha,
+                    gamma=self.cfg.focal_gamma,
+                    reduction="mean",
+                )
+                dup_target_logits = pred_targetness[batch_idx][assign.duplicate_mask]
+                total_targetness = total_targetness + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
+                    dup_target_logits,
                     dup_targets,
                     alpha=self.cfg.focal_alpha,
                     gamma=self.cfg.focal_gamma,
@@ -462,6 +485,14 @@ class PromptDetectionLoss(torch.nn.Module):
                     reduction="none",
                 )
                 total_objectness = total_objectness + weighted_mean(non_target_objectness, region_weights)
+                non_target_targetness = sigmoid_varifocal_loss(
+                    pred_targetness[batch_idx][non_target_mask],
+                    torch.zeros_like(pred_targetness[batch_idx][non_target_mask]),
+                    alpha=self.cfg.focal_alpha,
+                    gamma=self.cfg.focal_gamma,
+                    reduction="none",
+                )
+                total_targetness = total_targetness + weighted_mean(non_target_targetness, region_weights)
 
                 non_target_scores = pred_scores[batch_idx][non_target_mask][:, valid_class_mask]
                 if non_target_scores.numel() > 0:
@@ -485,12 +516,17 @@ class PromptDetectionLoss(torch.nn.Module):
                 total_neg += neg_count
                 neg_scores = pred_prob[neg_mask][:, valid_class_mask]
                 if neg_scores.numel() > 0:
-                    neg_joint_scores = torch.sqrt((pred_obj[neg_mask] * neg_scores.max(dim=-1).values).clamp(min=0.0))
+                    neg_joint_scores = (
+                        pred_obj[neg_mask]
+                        * pred_tgt[neg_mask]
+                        * neg_scores.max(dim=-1).values
+                    ).clamp(min=0.0).pow(1.0 / 3.0)
                     total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
 
         num_batches = max(len(targets), 1)
         return {
             "loss_objectness": total_objectness / num_batches,
+            "loss_targetness": total_targetness / num_batches,
             "loss_match": total_match / num_batches,
             "loss_iou": total_iou / num_batches,
             "loss_dfl": total_dfl / num_batches,
@@ -512,6 +548,7 @@ class PromptDetectionLoss(torch.nn.Module):
 
         loss_one2many = (
             self.cfg.objectness_weight * one2many["loss_objectness"]
+            + self.cfg.targetness_weight * one2many["loss_targetness"]
             + self.cfg.match_weight * one2many["loss_match"]
             + self.cfg.iou_weight * one2many["loss_iou"]
             + self.cfg.dfl_weight * one2many["loss_dfl"]
@@ -519,6 +556,7 @@ class PromptDetectionLoss(torch.nn.Module):
         )
         loss_one2one = (
             self.cfg.objectness_weight * one2one["loss_objectness"]
+            + self.cfg.targetness_weight * one2one["loss_targetness"]
             + self.cfg.match_weight * one2one["loss_match"]
             + self.cfg.iou_weight * one2one["loss_iou"]
             + self.cfg.dfl_weight * one2one["loss_dfl"]
@@ -531,6 +569,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_one2many": loss_one2many.detach(),
             "loss_one2one": loss_one2one.detach(),
             "loss_objectness": one2one["loss_objectness"],
+            "loss_targetness": one2one["loss_targetness"],
             "loss_match": one2one["loss_match"],
             "loss_iou": one2one["loss_iou"],
             "loss_dfl": one2one["loss_dfl"],

@@ -80,6 +80,7 @@ class PromptDET(nn.Module):
     def _decode_branch(self, outputs: Dict[str, List[torch.Tensor]]) -> Dict[str, torch.Tensor]:
         box_logits = outputs["box_logits"]
         objectness_logits = outputs["objectness_logits"]
+        targetness_logits = outputs["targetness_logits"]
         class_embeddings = outputs["class_embeddings"]
         class_prototypes = outputs["class_prototypes"]
         class_detail_tokens = outputs["class_detail_tokens"]
@@ -93,14 +94,16 @@ class PromptDET(nn.Module):
 
         box_parts = []
         objectness_parts = []
+        targetness_parts = []
         score_parts = []
         stride_parts = []
         flat_box_logits = []
         class_prototypes = F.normalize(class_prototypes, dim=-1)
         class_detail_tokens = F.normalize(class_detail_tokens, dim=-1)
-        for box_logit, objectness_logit, class_embedding, stride in zip(
+        for box_logit, objectness_logit, targetness_logit, class_embedding, stride in zip(
             box_logits,
             objectness_logits,
+            targetness_logits,
             class_embeddings,
             outputs["strides"],
         ):
@@ -114,6 +117,8 @@ class PromptDET(nn.Module):
             flat_box_logits.append(box_logit)
             flat_objectness = objectness_logit.flatten(2).transpose(1, 2).squeeze(-1)
             objectness_parts.append(flat_objectness)
+            flat_targetness = targetness_logit.flatten(2).transpose(1, 2).squeeze(-1)
+            targetness_parts.append(flat_targetness)
             flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1)
             global_scores = torch.einsum("bnd,bkd->bnk", flat_embeddings, class_prototypes)
             detail_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, class_detail_tokens).max(dim=-1).values
@@ -136,6 +141,7 @@ class PromptDET(nn.Module):
             "pred_boxes": pred_boxes,
             "pred_scores": torch.cat(score_parts, dim=1),
             "pred_objectness": pred_objectness,
+            "pred_targetness": torch.cat(targetness_parts, dim=1),
             "anchor_points": anchor_points,
             "stride_tensor": torch.cat(stride_parts, dim=0),
             "box_distribution": torch.cat(flat_box_logits, dim=1),
@@ -178,6 +184,7 @@ class PromptDET(nn.Module):
         pred_logits = branch["pred_scores"]
         pred_scores = pred_logits.sigmoid()
         pred_objectness = branch["pred_objectness"].sigmoid()
+        pred_targetness = branch["pred_targetness"].sigmoid()
         decoded_class_mask = branch["class_mask"]
         feature_shapes = branch["feature_shapes"]
 
@@ -208,7 +215,11 @@ class PromptDET(nn.Module):
                 continue
 
             class_scores_max, class_index = valid_scores.max(dim=1)
-            scores = torch.sqrt((class_scores_max * pred_objectness[batch_idx]).clamp(min=0.0))
+            scores = (
+                class_scores_max
+                * pred_objectness[batch_idx]
+                * pred_targetness[batch_idx]
+            ).clamp(min=0.0).pow(1.0 / 3.0)
             if one2one_peak_kernel > 1:
                 pad = one2one_peak_kernel // 2
                 level_keep = []
