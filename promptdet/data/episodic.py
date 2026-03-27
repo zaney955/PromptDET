@@ -66,6 +66,10 @@ class PromptEpisodeDataset(Dataset):
         self.categories = {item["id"]: item["name"] for item in payload["categories"]}
         self.class_to_family: Dict[int, str] = {}
         self.family_to_classes: Dict[str, set[int]] = defaultdict(set)
+        self.family_confusions: Dict[str, set[str]] = {
+            "diamond": {"triangle"},
+            "triangle": {"diamond"},
+        }
         for category_id, category_name in self.categories.items():
             family = category_name.split("_")[-1] if "_" in category_name else category_name
             self.class_to_family[category_id] = family
@@ -159,6 +163,8 @@ class PromptEpisodeDataset(Dataset):
             if family is None:
                 continue
             confusable.update(self.family_to_classes[family] - prompt_class_set)
+            for related_family in self.family_confusions.get(family, set()):
+                confusable.update(self.family_to_classes.get(related_family, set()) - prompt_class_set)
         return confusable
 
     def _sample_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> Tuple[int, bool]:

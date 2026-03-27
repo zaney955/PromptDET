@@ -93,10 +93,12 @@ class PromptDET(nn.Module):
 
         box_parts = []
         objectness_parts = []
-        embedding_parts = []
+        score_parts = []
         peak_parts = []
         stride_parts = []
         flat_box_logits = []
+        class_prototypes = F.normalize(class_prototypes, dim=-1)
+        class_detail_tokens = F.normalize(class_detail_tokens, dim=-1)
         for box_logit, objectness_logit, class_embedding, stride in zip(
             box_logits,
             objectness_logits,
@@ -111,40 +113,39 @@ class PromptDET(nn.Module):
             dist = (probs * self.proj_bins.to(device)).sum(dim=-1) * stride
             box_parts.append(dist)
             flat_box_logits.append(box_logit)
-            objectness_parts.append(objectness_logit.flatten(2).transpose(1, 2).squeeze(-1))
-            embedding_parts.append(class_embedding.flatten(2).transpose(1, 2))
+            flat_objectness = objectness_logit.flatten(2).transpose(1, 2).squeeze(-1)
+            objectness_parts.append(flat_objectness)
+            flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1)
+            global_scores = torch.einsum("bnd,bkd->bnk", flat_embeddings, class_prototypes)
+            detail_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, class_detail_tokens).max(dim=-1).values
+            level_scores = (
+                (1.0 - self.cfg.detail_score_weight) * global_scores
+                + self.cfg.detail_score_weight * detail_scores
+            ) * logit_scale
+            level_scores = level_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
+            score_parts.append(level_scores)
+            targetness_logits = flat_objectness + level_scores.max(dim=-1).values
             if peak_kernel > 1:
                 pad = peak_kernel // 2
-                peak_mask = F.max_pool2d(objectness_logit, kernel_size=peak_kernel, stride=1, padding=pad).eq(
-                    objectness_logit
+                targetness_map = targetness_logits.view(b, 1, h, w)
+                peak_mask = F.max_pool2d(targetness_map, kernel_size=peak_kernel, stride=1, padding=pad).eq(
+                    targetness_map
                 )
             else:
-                peak_mask = torch.ones_like(objectness_logit, dtype=torch.bool)
+                peak_mask = torch.ones((b, 1, h, w), dtype=torch.bool, device=device)
             peak_parts.append(peak_mask.flatten(2).transpose(1, 2).squeeze(-1))
             stride_parts.append(torch.full((h * w, 1), stride, device=device))
 
         pred_dist = torch.cat(box_parts, dim=1)
         pred_objectness = torch.cat(objectness_parts, dim=1)
-        query_embeddings = torch.cat(embedding_parts, dim=1)
         pred_boxes = []
         for batch_idx in range(batch):
             pred_boxes.append(dist2bbox(anchor_points, pred_dist[batch_idx]))
         pred_boxes = torch.stack(pred_boxes, dim=0)
 
-        query_embeddings = F.normalize(query_embeddings, dim=-1)
-        class_prototypes = F.normalize(class_prototypes, dim=-1)
-        class_detail_tokens = F.normalize(class_detail_tokens, dim=-1)
-        global_scores = torch.einsum("bnd,bkd->bnk", query_embeddings, class_prototypes)
-        detail_scores = torch.einsum("bnd,bktd->bnkt", query_embeddings, class_detail_tokens).max(dim=-1).values
-        pred_scores = (
-            (1.0 - self.cfg.detail_score_weight) * global_scores
-            + self.cfg.detail_score_weight * detail_scores
-        ) * logit_scale
-        pred_scores = pred_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
-
         return {
             "pred_boxes": pred_boxes,
-            "pred_scores": pred_scores,
+            "pred_scores": torch.cat(score_parts, dim=1),
             "pred_objectness": pred_objectness,
             "anchor_points": anchor_points,
             "stride_tensor": torch.cat(stride_parts, dim=0),

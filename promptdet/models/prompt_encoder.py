@@ -139,22 +139,16 @@ class PromptEncoder(nn.Module):
         memory_tokens = class_local_tokens.reshape(batch_size, self.max_prompt_classes * token_count, -1)
         memory_mask = memory_mask.reshape(batch_size, self.max_prompt_classes * token_count)
 
-        global_prompt = masked_mean(class_prototypes, padded_class_mask, dim=1)
         scale_tokens = {
-            name: proj(class_prototypes)
+            name: proj(class_prototypes) * padded_class_mask.unsqueeze(-1)
             for name, proj in self.scale_proj.items()
-        }
-        scale_context = {
-            name: masked_mean(tokens, padded_class_mask, dim=1)
-            for name, tokens in scale_tokens.items()
         }
 
         return {
-            "global": global_prompt,
             "memory_tokens": memory_tokens,
             "memory_mask": memory_mask,
             "class_prototypes": class_prototypes,
             "class_detail_tokens": class_detail_tokens,
             "class_mask": padded_class_mask,
-            "scale_context": scale_context,
+            "scale_tokens": scale_tokens,
         }
