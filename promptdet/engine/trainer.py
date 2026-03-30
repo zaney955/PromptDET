@@ -33,6 +33,9 @@ def _move_targets(targets, device: torch.device):
             "boxes": target["boxes"].to(device),
             "labels": target["labels"].to(device),
             "category_ids": target["category_ids"].to(device),
+            "query_canvas_target": target["query_canvas_target"].to(device),
+            "query_canvas_label": target["query_canvas_label"].to(device),
+            "query_canvas_weight": target["query_canvas_weight"].to(device),
             "non_target_boxes": target["non_target_boxes"].to(device),
             "non_target_weights": target["non_target_weights"].to(device),
             "image_size": target["image_size"],
@@ -77,22 +80,35 @@ def train(
             "loss_one2one": 0.0,
             "loss_objectness": 0.0,
             "loss_targetness": 0.0,
+            "loss_null": 0.0,
             "loss_match": 0.0,
             "loss_iou": 0.0,
             "loss_dfl": 0.0,
+            "loss_box_prior": 0.0,
             "loss_contrast": 0.0,
+            "loss_ctx_recon": 0.0,
+            "loss_ctx_prior": 0.0,
             "num_pos": 0.0,
             "num_neg": 0.0,
             "mean_pos_score": 0.0,
             "mean_neg_score": 0.0,
             "mean_matched_iou": 0.0,
         }
+        if hasattr(model_without_ddp, "set_context_prior_strength"):
+            warmup_epochs = max(int(config.train.epochs * config.context_painter.prior_warmup_ratio), 1)
+            if epoch + 1 <= warmup_epochs:
+                ratio = (epoch + 1) / warmup_epochs
+                model_without_ddp.set_context_prior_strength(0.25 + 0.75 * ratio)
+            else:
+                model_without_ddp.set_context_prior_strength(1.0)
         num_steps = 0
         for batch in pbar:
             prompt_images = batch["prompt_images"].to(device)
             prompt_boxes = batch["prompt_boxes"].to(device)
+            prompt_canvas = batch["prompt_canvas"].to(device)
             prompt_class_indices = batch["prompt_class_indices"].to(device)
             prompt_instance_mask = batch["prompt_instance_mask"].to(device)
+            context_colors = batch["context_colors"].to(device)
             prompt_class_mask = batch["prompt_class_mask"].to(device)
             prompt_type = batch["prompt_type"].to(device)
             query_image = batch["query_image"].to(device)
@@ -111,6 +127,8 @@ def train(
                     prompt_class_indices,
                     prompt_instance_mask,
                     prompt_class_mask,
+                    prompt_canvas,
+                    context_colors,
                     query_image,
                     prompt_type,
                 )
@@ -134,6 +152,9 @@ def train(
                 o2o=f"{float(losses['loss_one2one'].item()):.4f}",
                 obj=f"{float(losses['loss_objectness'].item()):.4f}",
                 tgt=f"{float(losses['loss_targetness'].item()):.4f}",
+                nul=f"{float(losses['loss_null'].item()):.4f}",
+                box=f"{float(losses['loss_box_prior'].item()):.4f}",
+                ctx=f"{float(losses['loss_ctx_prior'].item()):.4f}",
                 pos=f"{float(losses['num_pos'].item()):.1f}",
                 ps=f"{float(losses['mean_pos_score'].item()):.3f}",
                 ns=f"{float(losses['mean_neg_score'].item()):.3f}",
@@ -155,6 +176,8 @@ def train(
                 pre_nms_topk=config.train.pre_nms_topk,
                 one2one_topk=config.train.one2one_topk,
                 one2one_peak_kernel=config.train.one2one_peak_kernel,
+                oversize_box_threshold=config.train.oversize_box_threshold,
+                oversize_box_gamma=config.train.oversize_box_gamma,
                 max_det=config.train.max_det,
             )
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})

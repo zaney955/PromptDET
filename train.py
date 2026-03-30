@@ -91,6 +91,8 @@ def main():
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
+        color_min_distance=config.context_painter.color_min_distance,
+        soft_box_sigma=config.context_painter.soft_box_sigma,
     )
     val_dataset = PromptEpisodeDataset(
         image_list_path=config.data.val_list,
@@ -105,6 +107,8 @@ def main():
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
+        color_min_distance=config.context_painter.color_min_distance,
+        soft_box_sigma=config.context_painter.soft_box_sigma,
     )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist_info["distributed"] else None
@@ -129,7 +133,7 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    model = PromptDET(config.model).to(device)
+    model = PromptDET(config.model, config.context_painter).to(device)
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
     if dist_info["distributed"]:
@@ -137,7 +141,7 @@ def main():
         if device.type == "cuda":
             ddp_kwargs.update({"device_ids": [dist_info["local_rank"]], "output_device": dist_info["local_rank"]})
         model = DDP(model, **ddp_kwargs)
-    loss_fn = PromptDetectionLoss(config.model.reg_max, config.loss)
+    loss_fn = PromptDetectionLoss(config.model.reg_max, config.loss, config.context_painter)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.train.lr, weight_decay=config.train.weight_decay)
 
     try:

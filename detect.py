@@ -3,15 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import random
 
 from PIL import Image
 import torch
 
 from promptdet.config import load_config
+from promptdet.data.context_canvas import render_canvas_from_boxes, sample_context_colors
 from promptdet.models.promptdet import PromptDET
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 from promptdet.utils.checkpoint import load_checkpoint
-from promptdet.utils.visualize import save_detection_visualization
+from promptdet.utils.visualize import save_context_prior_visualizations, save_detection_visualization
 
 
 def pil_to_tensor(image: Image.Image) -> torch.Tensor:
@@ -24,6 +26,13 @@ def pil_to_tensor(image: Image.Image) -> torch.Tensor:
 def resize_image(image: Image.Image, size: int) -> torch.Tensor:
     image = image.resize((size, size), Image.Resampling.BILINEAR)
     return pil_to_tensor(image)
+
+
+def _valid_yolo_box(box: list[float] | tuple[float, ...]) -> bool:
+    if len(box) != 4:
+        return False
+    center_x, center_y, width, height = [float(value) for value in box]
+    return 0.0 <= center_x <= 1.0 and 0.0 <= center_y <= 1.0 and 0.0 < width <= 1.0 and 0.0 < height <= 1.0
 
 
 def parse_args():
@@ -42,6 +51,8 @@ def parse_args():
     parser.add_argument("--pre-nms-topk", type=int, default=None)
     parser.add_argument("--one2one-topk", type=int, default=None)
     parser.add_argument("--one2one-peak-kernel", type=int, default=None)
+    parser.add_argument("--oversize-box-threshold", type=float, default=None)
+    parser.add_argument("--oversize-box-gamma", type=float, default=None)
     parser.add_argument("--max-det", type=int, default=None)
     return parser.parse_args()
 
@@ -59,7 +70,13 @@ def _iter_query_images(query_path: Path) -> list[Path]:
     return image_paths
 
 
-def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
+def _load_prompt_set(
+    args,
+    image_size: int,
+    max_prompt_classes: int,
+    color_min_distance: float,
+    soft_box_sigma: float,
+):
     if args.prompt_spec:
         prompt_spec_path = Path(args.prompt_spec).resolve()
         payload = json.loads(prompt_spec_path.read_text(encoding="utf-8"))
@@ -75,9 +92,11 @@ def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
 
     prompt_images = []
     prompt_boxes = []
+    prompt_canvases = []
     prompt_class_indices = []
     label_to_slot = {}
 
+    rng = random.Random()
     for prompt in prompts:
         prompt_image_path = Path(prompt["image"])
         if not prompt_image_path.is_absolute() and prompt_spec_path is not None:
@@ -86,9 +105,15 @@ def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
         resized = resize_image(prompt_image, image_size)
         for ann in prompt["annotations"]:
             label = int(ann["label"])
+            bbox_raw = ann["bbox"]
+            if not _valid_yolo_box(bbox_raw):
+                raise ValueError(
+                    "prompt_spec annotations must use normalized YOLO xywh boxes in [0, 1]. "
+                    f"Got bbox={bbox_raw} for image={prompt_image_path} label={label}."
+                )
             slot = label_to_slot.setdefault(label, len(label_to_slot))
             bbox = yolo_xywh_to_xyxy_tensor(
-                torch.tensor([ann["bbox"]], dtype=torch.float32),
+                torch.tensor([bbox_raw], dtype=torch.float32),
                 prompt_image.size[0],
                 prompt_image.size[1],
             )[0]
@@ -103,6 +128,17 @@ def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
     if len(label_to_slot) > max_prompt_classes:
         raise ValueError("Prompt set exceeds model.max_prompt_classes.")
 
+    context_colors = sample_context_colors(len(label_to_slot), color_min_distance, rng=rng)
+    for bbox, slot in zip(prompt_boxes, prompt_class_indices):
+        canvas, _, _ = render_canvas_from_boxes(
+            image_size,
+            bbox.unsqueeze(0),
+            torch.tensor([slot], dtype=torch.long),
+            context_colors,
+            sigma_scale=soft_box_sigma,
+        )
+        prompt_canvases.append(canvas)
+
     prompt_class_ids = [None] * len(label_to_slot)
     for label, slot in label_to_slot.items():
         prompt_class_ids[slot] = label
@@ -110,10 +146,12 @@ def _load_prompt_set(args, image_size: int, max_prompt_classes: int):
     return {
         "prompt_images": torch.stack(prompt_images, dim=0).unsqueeze(0),
         "prompt_boxes": torch.stack(prompt_boxes, dim=0).unsqueeze(0),
+        "prompt_canvas": torch.stack(prompt_canvases, dim=0).unsqueeze(0),
         "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long).unsqueeze(0),
         "prompt_instance_mask": torch.ones((1, len(prompt_images)), dtype=torch.bool),
         "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long).unsqueeze(0),
         "prompt_class_mask": torch.ones((1, len(prompt_class_ids)), dtype=torch.bool),
+        "context_colors": context_colors.unsqueeze(0),
         "prompt_type": torch.tensor([0], dtype=torch.long),
     }
 
@@ -129,8 +167,10 @@ def _run_single_query(
     pre_nms_topk: int,
     one2one_topk: int,
     one2one_peak_kernel: int,
+    oversize_box_threshold: float,
+    oversize_box_gamma: float,
     max_det: int,
-) -> tuple[Image.Image, dict[str, torch.Tensor]]:
+) -> tuple[Image.Image, dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
     query_pil = Image.open(query_path).convert("RGB")
     query_tensor = resize_image(query_pil, image_size).unsqueeze(0).to(device)
     if device.type == "cuda":
@@ -143,6 +183,8 @@ def _run_single_query(
             prompt_batch["prompt_class_indices"].to(device),
             prompt_batch["prompt_instance_mask"].to(device),
             prompt_batch["prompt_class_mask"].to(device),
+            prompt_batch["prompt_canvas"].to(device),
+            prompt_batch["context_colors"].to(device),
             query_tensor,
             prompt_batch["prompt_type"].to(device),
         )
@@ -156,6 +198,8 @@ def _run_single_query(
             pre_nms_topk=pre_nms_topk,
             one2one_topk=one2one_topk,
             one2one_peak_kernel=one2one_peak_kernel,
+            oversize_box_threshold=oversize_box_threshold,
+            oversize_box_gamma=oversize_box_gamma,
             max_det=max_det,
         )[0]
 
@@ -163,7 +207,8 @@ def _run_single_query(
     boxes[:, 0::2] *= query_pil.size[0] / image_size
     boxes[:, 1::2] *= query_pil.size[1] / image_size
     preds["boxes"] = boxes
-    return query_pil, preds
+    context_aux = raw.get("context_aux")
+    return query_pil, preds, context_aux
 
 
 def main():
@@ -181,17 +226,28 @@ def main():
         config.train.one2one_topk = args.one2one_topk
     if args.one2one_peak_kernel is not None:
         config.train.one2one_peak_kernel = args.one2one_peak_kernel
+    if args.oversize_box_threshold is not None:
+        config.train.oversize_box_threshold = args.oversize_box_threshold
+    if args.oversize_box_gamma is not None:
+        config.train.oversize_box_gamma = args.oversize_box_gamma
     if args.max_det is not None:
         config.train.max_det = args.max_det
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
 
-    model = PromptDET(config.model).to(device)
+    model = PromptDET(config.model, config.context_painter).to(device)
     if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
     load_checkpoint(args.checkpoint, model, map_location=device.type)
     model.eval()
+    model.set_context_prior_strength(1.0)
 
-    prompt_batch = _load_prompt_set(args, config.model.image_size, config.model.max_prompt_classes)
+    prompt_batch = _load_prompt_set(
+        args,
+        config.model.image_size,
+        config.model.max_prompt_classes,
+        config.context_painter.color_min_distance,
+        config.context_painter.soft_box_sigma,
+    )
     query_path = Path(args.query_image).resolve()
     query_images = _iter_query_images(query_path)
     output_dir = Path(args.output_dir)
@@ -200,7 +256,7 @@ def main():
     batch_summary = []
 
     for current_query_path in query_images:
-        query_pil, preds = _run_single_query(
+        query_pil, preds, context_aux = _run_single_query(
             model,
             prompt_batch,
             current_query_path,
@@ -211,6 +267,8 @@ def main():
             pre_nms_topk=config.train.pre_nms_topk,
             one2one_topk=config.train.one2one_topk,
             one2one_peak_kernel=config.train.one2one_peak_kernel,
+            oversize_box_threshold=config.train.oversize_box_threshold,
+            oversize_box_gamma=config.train.oversize_box_gamma,
             max_det=config.train.max_det,
         )
         payload = {
@@ -222,6 +280,12 @@ def main():
         current_output_dir = output_dir / current_query_path.stem if batch_mode else output_dir
         current_output_dir.mkdir(parents=True, exist_ok=True)
         save_detection_visualization(query_pil, preds, current_output_dir / "prediction.png")
+        if context_aux is not None:
+            save_context_prior_visualizations(
+                context_aux["slot_prior_map"][0].cpu(),
+                prompt_batch["context_colors"][0, :prompt_batch["prompt_class_mask"].shape[1]].cpu(),
+                current_output_dir,
+            )
         (current_output_dir / "prediction.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

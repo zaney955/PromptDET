@@ -73,7 +73,7 @@ def _validate_split(
 
 def _validate_prompt_spec(
     prompt_spec_path: Path,
-    train_annotations: dict[str, list[tuple[int, list[float]]]],
+    annotations_by_file: dict[str, list[tuple[int, list[float]]]],
     class_names: dict[int, str],
 ) -> list[str]:
     errors: list[str] = []
@@ -84,9 +84,9 @@ def _validate_prompt_spec(
         if not resolved.exists():
             errors.append(f"prompt[{prompt_idx}] image path does not exist after resolution: {resolved}")
             continue
-        gt_anns = train_annotations.get(resolved.name)
+        gt_anns = annotations_by_file.get(resolved.name)
         if gt_anns is None:
-            errors.append(f"prompt[{prompt_idx}] references image not present in train split: {resolved.name}")
+            errors.append(f"prompt[{prompt_idx}] references image not present in dataset splits: {resolved.name}")
             continue
         for ann_idx, ann in enumerate(prompt.get("annotations", [])):
             label = int(ann["label"])
@@ -122,8 +122,9 @@ def main():
 
     class_names = load_class_names(class_names_path)
     train_errors, train_annotations, train_images, train_annotation_count = _validate_split(data_dir, "train", class_names)
-    val_errors, _, val_images, val_annotation_count = _validate_split(data_dir, "val", class_names)
-    prompt_errors = _validate_prompt_spec(prompt_spec_path, train_annotations, class_names)
+    val_errors, val_annotations, val_images, val_annotation_count = _validate_split(data_dir, "val", class_names)
+    all_annotations = {**train_annotations, **val_annotations}
+    prompt_errors = _validate_prompt_spec(prompt_spec_path, all_annotations, class_names)
     errors = [*train_errors, *val_errors, *prompt_errors]
 
     if errors:

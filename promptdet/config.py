@@ -25,6 +25,22 @@ class ModelConfig:
 
 
 @dataclass
+class ContextPainterConfig:
+    enabled: bool = True
+    scale: str = "p4"
+    dim: int = 256
+    depth: int = 6
+    num_heads: int = 8
+    feature_ensemble_start: int = 2
+    recon_weight: float = 0.5
+    prior_weight: float = 1.0
+    prior_warmup_ratio: float = 0.1
+    color_min_distance: float = 0.45
+    soft_box_sigma: float = 0.35
+    color_temperature: float = 10.0
+
+
+@dataclass
 class DataConfig:
     train_list: str = ""
     val_list: str = ""
@@ -59,6 +75,8 @@ class TrainConfig:
     pre_nms_topk: int = 256
     one2one_topk: int = 300
     one2one_peak_kernel: int = 3
+    oversize_box_threshold: float = 0.85
+    oversize_box_gamma: float = 20.0
     max_det: int = 100
     eval_interval: int = 1
     save_interval: int = 1
@@ -77,6 +95,7 @@ class LossConfig:
     non_target_center_sampling_radius: float = 0.75
     objectness_weight: float = 1.0
     targetness_weight: float = 1.0
+    null_weight: float = 0.5
     match_weight: float = 1.0
     iou_weight: float = 7.5
     dfl_weight: float = 1.5
@@ -84,6 +103,9 @@ class LossConfig:
     non_target_weight: float = 1.0
     confusable_non_target_weight: float = 2.0
     non_target_logit_margin: float = 0.0
+    oversize_box_weight: float = 0.5
+    oversize_box_threshold: float = 0.85
+    oversize_box_topk: int = 16
     contrast_weight: float = 0.25
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
@@ -95,6 +117,7 @@ class LossConfig:
 @dataclass
 class PromptDetConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
+    context_painter: ContextPainterConfig = field(default_factory=ContextPainterConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     loss: LossConfig = field(default_factory=LossConfig)

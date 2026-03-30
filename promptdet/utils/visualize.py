@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable
 
+import numpy as np
 from PIL import Image, ImageDraw
 import torch
 
@@ -43,3 +44,26 @@ def save_detection_visualization(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rendered.save(output_path)
+
+
+def save_context_prior_visualizations(
+    slot_prior_map: torch.Tensor,
+    context_colors: torch.Tensor,
+    output_dir: str | Path,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prior = slot_prior_map.detach().cpu()
+    colors = context_colors.detach().cpu().clamp(0.0, 1.0)
+    fg_prior = (1.0 - prior[0]).clamp(0.0, 1.0).mul(255).byte().numpy()
+    Image.fromarray(fg_prior, mode="L").save(output_dir / "fg_prior.png")
+
+    argmax = prior.argmax(dim=0)
+    color_canvas = torch.zeros((3, *argmax.shape), dtype=torch.float32)
+    for slot_idx in range(1, prior.shape[0]):
+        mask = argmax == slot_idx
+        if slot_idx - 1 < colors.shape[0]:
+            color_canvas[:, mask] = colors[slot_idx - 1].view(3, 1)
+    color_canvas = (color_canvas.permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
+    Image.fromarray(color_canvas, mode="RGB").save(output_dir / "slot_prior_argmax.png")

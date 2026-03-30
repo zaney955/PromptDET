@@ -19,17 +19,23 @@ def evaluate(
     pre_nms_topk: int,
     one2one_topk: int,
     one2one_peak_kernel: int,
+    oversize_box_threshold: float,
+    oversize_box_gamma: float,
     max_det: int,
 ) -> Dict[str, float]:
     model.eval()
     model_without_ddp = unwrap_model(model)
+    if hasattr(model_without_ddp, "set_context_prior_strength"):
+        model_without_ddp.set_context_prior_strength(1.0)
     items = []
     for batch in dataloader:
         prompt_images = batch["prompt_images"].to(device)
         prompt_boxes = batch["prompt_boxes"].to(device)
+        prompt_canvas = batch["prompt_canvas"].to(device)
         prompt_class_indices = batch["prompt_class_indices"].to(device)
         prompt_instance_mask = batch["prompt_instance_mask"].to(device)
         prompt_class_ids = batch["prompt_class_ids"].to(device)
+        context_colors = batch["context_colors"].to(device)
         prompt_class_mask = batch["prompt_class_mask"].to(device)
         prompt_type = batch["prompt_type"].to(device)
         query_image = batch["query_image"].to(device)
@@ -40,6 +46,8 @@ def evaluate(
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
+            prompt_canvas,
+            context_colors,
             query_image,
             prompt_type,
         )
@@ -53,6 +61,8 @@ def evaluate(
             pre_nms_topk=pre_nms_topk,
             one2one_topk=one2one_topk,
             one2one_peak_kernel=one2one_peak_kernel,
+            oversize_box_threshold=oversize_box_threshold,
+            oversize_box_gamma=oversize_box_gamma,
             max_det=max_det,
         )
         for pred, target in zip(preds, batch["targets"]):

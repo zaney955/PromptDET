@@ -6,7 +6,7 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 
-from promptdet.config import LossConfig
+from promptdet.config import ContextPainterConfig, LossConfig
 
 from .box_ops import bbox2dist, bbox_ciou, bbox_iou
 
@@ -86,6 +86,23 @@ def max_prompt_logit_margin_loss(logits: torch.Tensor, margin: float) -> torch.T
     return F.relu(logits.max(dim=-1).values - margin)
 
 
+def oversize_box_penalty(boxes: torch.Tensor, image_size: int, area_threshold: float) -> torch.Tensor:
+    x1 = boxes[:, 0].clamp(0.0, float(image_size))
+    y1 = boxes[:, 1].clamp(0.0, float(image_size))
+    x2 = boxes[:, 2].clamp(0.0, float(image_size))
+    y2 = boxes[:, 3].clamp(0.0, float(image_size))
+    widths = (x2 - x1).clamp(min=0.0)
+    heights = (y2 - y1).clamp(min=0.0)
+    area_ratio = (widths * heights) / max(float(image_size * image_size), 1.0)
+    edge_touch = (
+        (x1 <= 1.0).float()
+        + (y1 <= 1.0).float()
+        + (x2 >= image_size - 1.0).float()
+        + (y2 >= image_size - 1.0).float()
+    ) / 4.0
+    return (area_ratio - area_threshold).clamp(min=0.0) * (1.0 + edge_touch)
+
+
 class PromptTaskAlignedAssigner:
     def __init__(self, topk: int = 13, alpha: float = 1.0, beta: float = 6.0, center_sampling_radius: float = 0.5):
         self.topk = topk
@@ -96,6 +113,7 @@ class PromptTaskAlignedAssigner:
     def assign(
         self,
         pred_scores: torch.Tensor,
+        pred_slot_priors: torch.Tensor,
         pred_boxes: torch.Tensor,
         pred_objectness: torch.Tensor,
         pred_targetness: torch.Tensor,
@@ -152,7 +170,13 @@ class PromptTaskAlignedAssigner:
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
-            quality = (pred_obj[candidate_inds] * pred_tgt[candidate_inds] * cls_scores).clamp(min=0.0).pow(1.0 / 3.0)
+            prior_scores = pred_slot_priors[candidate_inds, class_idx].clamp(min=1e-4)
+            quality = (
+                pred_obj[candidate_inds]
+                * pred_tgt[candidate_inds]
+                * cls_scores
+                * prior_scores
+            ).clamp(min=0.0).pow(0.25)
             align = quality.pow(self.alpha) * ious.pow(self.beta) * center_prior
 
             topk = min(self.topk, candidate_inds.numel())
@@ -196,6 +220,7 @@ class PromptOneToOneAssigner:
     def assign(
         self,
         pred_scores: torch.Tensor,
+        pred_slot_priors: torch.Tensor,
         pred_boxes: torch.Tensor,
         pred_objectness: torch.Tensor,
         pred_targetness: torch.Tensor,
@@ -244,7 +269,13 @@ class PromptOneToOneAssigner:
             candidate_boxes = pred_boxes[candidate_inds]
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
-            quality = (pred_obj[candidate_inds] * pred_tgt[candidate_inds] * cls_scores).clamp(min=0.0).pow(1.0 / 3.0)
+            prior_scores = pred_slot_priors[candidate_inds, class_idx].clamp(min=1e-4)
+            quality = (
+                pred_obj[candidate_inds]
+                * pred_tgt[candidate_inds]
+                * cls_scores
+                * prior_scores
+            ).clamp(min=0.0).pow(0.25)
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
             metric = quality * ious.pow(2) * center_prior.pow(2)
             top_limit = min(candidate_inds.numel(), self.candidate_topk)
@@ -296,7 +327,7 @@ class DFLoss(torch.nn.Module):
 
 
 class PromptDetectionLoss(torch.nn.Module):
-    def __init__(self, reg_max: int, cfg: LossConfig):
+    def __init__(self, reg_max: int, cfg: LossConfig, context_cfg: ContextPainterConfig | None = None):
         super().__init__()
         self.reg_max = reg_max
         self.one2many_assigner = PromptTaskAlignedAssigner(
@@ -312,6 +343,7 @@ class PromptDetectionLoss(torch.nn.Module):
         )
         self.dfl = DFLoss(reg_max)
         self.cfg = cfg
+        self.context_cfg = context_cfg or ContextPainterConfig(enabled=False)
 
     def _branch_loss(
         self,
@@ -321,8 +353,10 @@ class PromptDetectionLoss(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         pred_boxes = outputs["pred_boxes"]
         pred_scores = outputs["pred_scores"]
+        pred_slot_priors = outputs["pred_slot_priors"]
         pred_objectness = outputs["pred_objectness"]
         pred_targetness = outputs["pred_targetness"]
+        pred_null_logits = outputs["pred_null_logits"]
         anchor_points = outputs["anchor_points"]
         stride_tensor = outputs["stride_tensor"]
         box_logits = outputs["box_distribution"]
@@ -330,9 +364,11 @@ class PromptDetectionLoss(torch.nn.Module):
 
         total_objectness = pred_scores.new_tensor(0.0)
         total_targetness = pred_scores.new_tensor(0.0)
+        total_null = pred_scores.new_tensor(0.0)
         total_match = pred_scores.new_tensor(0.0)
         total_iou = pred_scores.new_tensor(0.0)
         total_dfl = pred_scores.new_tensor(0.0)
+        total_box_prior = pred_scores.new_tensor(0.0)
         total_pos = 0
         total_neg = 0
         total_pos_score_sum = pred_scores.new_tensor(0.0)
@@ -349,6 +385,7 @@ class PromptDetectionLoss(torch.nn.Module):
             valid_class_mask = class_mask[batch_idx]
             assign = assigner.assign(
                 pred_scores[batch_idx],
+                pred_slot_priors[batch_idx],
                 pred_boxes[batch_idx],
                 pred_objectness[batch_idx],
                 pred_targetness[batch_idx],
@@ -384,6 +421,12 @@ class PromptDetectionLoss(torch.nn.Module):
                 objectness_target,
                 alpha=self.cfg.focal_alpha,
                 gamma=self.cfg.focal_gamma,
+                reduction="mean",
+            )
+            null_target = (~assign.fg_mask).float()
+            total_null = total_null + F.binary_cross_entropy_with_logits(
+                pred_null_logits[batch_idx],
+                null_target,
                 reduction="mean",
             )
 
@@ -523,19 +566,90 @@ class PromptDetectionLoss(torch.nn.Module):
                     ).clamp(min=0.0).pow(1.0 / 3.0)
                     total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
 
+            oversize_mask = ~assign.fg_mask
+            if oversize_mask.any():
+                neg_scores_all = pred_prob[:, valid_class_mask]
+                if neg_scores_all.numel() > 0:
+                    prompt_keep = (1.0 - pred_null_logits[batch_idx].sigmoid()).clamp(min=0.0)
+                    oversize_joint = (
+                        pred_obj
+                        * pred_tgt
+                        * neg_scores_all.max(dim=-1).values
+                        * prompt_keep
+                    ).clamp(min=0.0).pow(0.25)
+                    oversize_idx = torch.nonzero(oversize_mask, as_tuple=False).squeeze(1)
+                    if oversize_idx.numel() > 0:
+                        topk = min(self.cfg.oversize_box_topk, oversize_idx.numel())
+                        _, order = torch.topk(oversize_joint[oversize_idx], k=topk)
+                        oversize_idx = oversize_idx[order]
+                        oversize_pen = oversize_box_penalty(
+                            pred_boxes[batch_idx][oversize_idx],
+                            image_size=target["image_size"],
+                            area_threshold=self.cfg.oversize_box_threshold,
+                        )
+                        if oversize_pen.numel() > 0 and torch.any(oversize_pen > 0):
+                            oversize_weights = oversize_joint[oversize_idx].detach().clamp(min=0.25)
+                            total_box_prior = total_box_prior + self.cfg.oversize_box_weight * weighted_mean(
+                                oversize_pen,
+                                oversize_weights,
+                            )
+
         num_batches = max(len(targets), 1)
         return {
             "loss_objectness": total_objectness / num_batches,
             "loss_targetness": total_targetness / num_batches,
+            "loss_null": total_null / num_batches,
             "loss_match": total_match / num_batches,
             "loss_iou": total_iou / num_batches,
             "loss_dfl": total_dfl / num_batches,
+            "loss_box_prior": total_box_prior / num_batches,
             "loss_contrast": total_contrast / num_batches,
             "num_pos": pred_scores.new_tensor(float(total_pos)),
             "num_neg": pred_scores.new_tensor(float(total_neg)),
             "mean_pos_score": (total_pos_score_sum / max(total_pos, 1)).detach(),
             "mean_neg_score": (total_neg_score_sum / max(total_neg, 1)).detach(),
             "mean_matched_iou": (total_matched_iou_sum / max(total_pos, 1)).detach(),
+        }
+
+    def _context_loss(
+        self,
+        context_aux: Dict[str, torch.Tensor] | None,
+        targets: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        if not self.context_cfg.enabled or context_aux is None:
+            device = targets[0]["boxes"].device if targets else torch.device("cpu")
+            zero = torch.zeros((), device=device)
+            return {
+                "loss_ctx_recon": zero,
+                "loss_ctx_prior": zero,
+            }
+
+        pred_canvas = context_aux["query_canvas_pred_rgb"]
+        slot_prior_logits = context_aux["slot_prior_logits"]
+        total_recon = pred_canvas.new_tensor(0.0)
+        total_prior = pred_canvas.new_tensor(0.0)
+
+        for batch_idx, target in enumerate(targets):
+            tgt_canvas = target["query_canvas_target"]
+            tgt_label = target["query_canvas_label"]
+            tgt_weight = target["query_canvas_weight"]
+
+            recon = F.smooth_l1_loss(pred_canvas[batch_idx], tgt_canvas, reduction="none")
+            recon_weight = tgt_weight.unsqueeze(0)
+            total_recon = total_recon + (recon * recon_weight).sum() / recon_weight.sum().clamp(min=1.0)
+
+            prior = F.cross_entropy(
+                slot_prior_logits[batch_idx].unsqueeze(0),
+                tgt_label.unsqueeze(0),
+                reduction="none",
+            ).squeeze(0)
+            prior_weight = 1.0 + tgt_weight
+            total_prior = total_prior + (prior * prior_weight).sum() / prior_weight.sum().clamp(min=1.0)
+
+        num_batches = max(len(targets), 1)
+        return {
+            "loss_ctx_recon": total_recon / num_batches,
+            "loss_ctx_prior": total_prior / num_batches,
         }
 
     def forward(
@@ -545,24 +659,34 @@ class PromptDetectionLoss(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         one2many = self._branch_loss(outputs["one2many"], targets, self.one2many_assigner)
         one2one = self._branch_loss(outputs["one2one"], targets, self.one2one_assigner)
+        context = self._context_loss(outputs.get("context_aux"), targets)
 
         loss_one2many = (
             self.cfg.objectness_weight * one2many["loss_objectness"]
             + self.cfg.targetness_weight * one2many["loss_targetness"]
+            + self.cfg.null_weight * one2many["loss_null"]
             + self.cfg.match_weight * one2many["loss_match"]
             + self.cfg.iou_weight * one2many["loss_iou"]
             + self.cfg.dfl_weight * one2many["loss_dfl"]
+            + one2many["loss_box_prior"]
             + self.cfg.contrast_weight * one2many["loss_contrast"]
         )
         loss_one2one = (
             self.cfg.objectness_weight * one2one["loss_objectness"]
             + self.cfg.targetness_weight * one2one["loss_targetness"]
+            + self.cfg.null_weight * one2one["loss_null"]
             + self.cfg.match_weight * one2one["loss_match"]
             + self.cfg.iou_weight * one2one["loss_iou"]
             + self.cfg.dfl_weight * one2one["loss_dfl"]
+            + one2one["loss_box_prior"]
             + self.cfg.contrast_weight * one2one["loss_contrast"]
         )
-        total_loss = self.cfg.one2many_weight * loss_one2many + self.cfg.one2one_weight * loss_one2one
+        total_loss = (
+            self.cfg.one2many_weight * loss_one2many
+            + self.cfg.one2one_weight * loss_one2one
+            + self.context_cfg.recon_weight * context["loss_ctx_recon"]
+            + self.context_cfg.prior_weight * context["loss_ctx_prior"]
+        )
 
         return {
             "loss": total_loss,
@@ -570,10 +694,14 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_one2one": loss_one2one.detach(),
             "loss_objectness": one2one["loss_objectness"],
             "loss_targetness": one2one["loss_targetness"],
+            "loss_null": one2one["loss_null"],
             "loss_match": one2one["loss_match"],
             "loss_iou": one2one["loss_iou"],
             "loss_dfl": one2one["loss_dfl"],
+            "loss_box_prior": one2one["loss_box_prior"],
             "loss_contrast": one2one["loss_contrast"],
+            "loss_ctx_recon": context["loss_ctx_recon"],
+            "loss_ctx_prior": context["loss_ctx_prior"],
             "num_pos": one2one["num_pos"],
             "num_neg": one2one["num_neg"],
             "mean_pos_score": one2one["mean_pos_score"],

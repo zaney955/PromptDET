@@ -17,7 +17,7 @@ The implementation combines:
 - dual detection heads:
   - `one2many` for dense auxiliary supervision during training
   - `one2one` for unique-matching final inference
-- quality-aware matching and NMS-free `one2one` inference with local peak filtering
+- quality-aware matching and NMS-free `one2one` inference with local peak filtering and oversize-box suppression
 
 ## Project Layout
 
@@ -176,6 +176,8 @@ Outputs:
 
 - `prediction.json`
 - `prediction.png`
+- `fg_prior.png`
+- `slot_prior_argmax.png`
 
 ## Detection Behavior
 
@@ -184,7 +186,8 @@ The intended prediction path is:
 
 - decode `one2one`
 - apply local peak filtering
-- combine objectness, prompt-conditioned targetness, and prompt-class confidence into a quality-aware score
+- combine objectness, prompt-conditioned targetness, prompt-class confidence, and null competition into a quality-aware score
+- apply size-aware suppression to near-full-image false boxes before thresholding
 - threshold
 - top-k
 
@@ -197,9 +200,14 @@ Implemented:
 - full modular prompt-conditioned detector with prompt-set episodes
 - shared backbone and PAN/FPN neck
 - prompt crop encoder with multi-instance class prototype aggregation
+- SegGPT-style context canvas rendering with random episode-local colors
+- `ContextPainter` dense in-context prior branch on `P4`
+- feature-ensemble query aggregation across multiple prompt instances
 - cross-attention prompt/query fusion with null-aware gating
 - dual-branch dense detection head with DFL regression
 - prompt-conditioned targetness prediction
+- explicit null competition against prompt classes during scoring
+- dense slot-prior / foreground-prior injection into the detection head
 - dynamic prompt-class assignment
 - `one2one` unique matching with duplicate suppression supervision
 - local peak filtering for NMS-free `one2one` inference
