@@ -27,19 +27,20 @@ class ModelConfig:
 
 
 @dataclass
-class ContextPainterConfig:
+class DenseGroundingConfig:
     enabled: bool = True
     scale: str = "p3"
     dim: int = 256
     depth: int = 4
     num_heads: int = 8
     feature_ensemble_start: int = 2
-    recon_weight: float = 0.0
+    slot_memory_tokens: int = 4
+    recon_decoder_dim: int = 64
+    query_mask_ratio: float = 1.0
+    canvas_loss_weight: float = 1.0
     prior_weight: float = 1.0
     prior_warmup_ratio: float = 0.1
-    color_min_distance: float = 0.45
-    soft_box_sigma: float = 0.35
-    color_temperature: float = 10.0
+    random_color_min_distance: float = 0.45
     hint_inner_shrink: float = 0.6
     hint_bg_expand: float = 0.12
     grabcut_iters: int = 2
@@ -48,6 +49,9 @@ class ContextPainterConfig:
     fg_bce_weight: float = 1.0
     fg_dice_weight: float = 1.0
     prior_consistency_weight: float = 0.5
+
+
+ContextPainterConfig = DenseGroundingConfig
 
 
 @dataclass
@@ -127,7 +131,7 @@ class LossConfig:
 @dataclass
 class PromptDetConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
-    context_painter: ContextPainterConfig = field(default_factory=ContextPainterConfig)
+    dense_grounding: DenseGroundingConfig = field(default_factory=DenseGroundingConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -135,9 +139,15 @@ class PromptDetConfig:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @property
+    def context_painter(self) -> DenseGroundingConfig:
+        return self.dense_grounding
+
 
 def _update_dataclass(instance: Any, payload: Dict[str, Any]) -> Any:
     for key, value in payload.items():
+        if not hasattr(instance, key):
+            continue
         current = getattr(instance, key)
         if hasattr(current, "__dataclass_fields__"):
             _update_dataclass(current, value)
@@ -151,6 +161,8 @@ def load_config(path: str | Path | None) -> PromptDetConfig:
     if path is None:
         return config
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "context_painter" in data and "dense_grounding" not in data:
+        data["dense_grounding"] = data.pop("context_painter")
     return _update_dataclass(config, data)
 
 

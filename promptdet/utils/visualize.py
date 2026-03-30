@@ -8,6 +8,11 @@ from PIL import Image, ImageDraw
 import torch
 
 
+def _rgb_tensor_to_image(rgb: torch.Tensor) -> Image.Image:
+    array = rgb.detach().cpu().permute(1, 2, 0).clamp(0.0, 1.0).mul(255).byte().numpy()
+    return Image.fromarray(array, mode="RGB")
+
+
 def draw_boxes(
     image: Image.Image,
     boxes: torch.Tensor,
@@ -72,9 +77,21 @@ def save_context_prior_visualizations(
 def save_grounding_visualizations(
     grounding_aux: Dict[str, torch.Tensor],
     output_dir: str | Path,
+    prompt_canvases: torch.Tensor | None = None,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if prompt_canvases is not None and prompt_canvases.numel() > 0:
+        prompt_tiles = [_rgb_tensor_to_image(canvas) for canvas in prompt_canvases]
+        width = sum(tile.width for tile in prompt_tiles)
+        height = max(tile.height for tile in prompt_tiles)
+        tiled = Image.new("RGB", (width, height))
+        offset = 0
+        for tile in prompt_tiles:
+            tiled.paste(tile, (offset, 0))
+            offset += tile.width
+        tiled.save(output_dir / "prompt_canvas.png")
 
     fg_prob = grounding_aux["fg_logits"][0].sigmoid().detach().cpu().squeeze(0)
     Image.fromarray(fg_prob.clamp(0.0, 1.0).mul(255).byte().numpy(), mode="L").save(output_dir / "grounding_fg.png")
@@ -99,3 +116,9 @@ def save_grounding_visualizations(
         palette[idx] = np.array([(37 * idx) % 255, (97 * idx) % 255, (181 * idx) % 255], dtype=np.uint8)
     slot_rgb = palette[slot_pred.numpy()]
     Image.fromarray(slot_rgb, mode="RGB").save(output_dir / "grounding_slot.png")
+    Image.fromarray(slot_rgb, mode="RGB").save(output_dir / "dense_slot_argmax.png")
+
+    if "query_canvas_pred_rgb" in grounding_aux:
+        _rgb_tensor_to_image(grounding_aux["query_canvas_pred_rgb"][0]).save(output_dir / "query_canvas_recon.png")
+    if "masked_query_canvas_rgb" in grounding_aux:
+        _rgb_tensor_to_image(grounding_aux["masked_query_canvas_rgb"][0]).save(output_dir / "masked_query_canvas.png")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 import numpy as np
@@ -167,6 +168,74 @@ def build_query_dense_targets(
     if num_slots >= 0:
         slot_target = slot_target.clamp(min=0, max=num_slots)
     return slot_target, fg_target, valid_mask, pseudo_mask_bank[: boxes.shape[0]]
+
+
+def sample_slot_colors(num_slots: int, min_distance: float = 0.45) -> torch.Tensor:
+    if num_slots <= 0:
+        return torch.zeros((0, 3), dtype=torch.float32)
+    base = torch.tensor(
+        [
+            [1.0, 0.25, 0.25],
+            [0.25, 0.7, 1.0],
+            [0.35, 1.0, 0.45],
+            [1.0, 0.85, 0.3],
+            [0.85, 0.45, 1.0],
+            [1.0, 0.55, 0.75],
+            [0.1, 1.0, 1.0],
+            [1.0, 0.5, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    colors: list[torch.Tensor] = []
+    for idx in range(num_slots):
+        if idx < base.shape[0]:
+            candidate = base[idx]
+        else:
+            accepted = False
+            for _ in range(64):
+                candidate = torch.rand(3) * 0.85 + 0.1
+                if not colors:
+                    accepted = True
+                    break
+                dist = torch.stack([torch.norm(candidate - item, p=2) for item in colors])
+                if float(dist.min().item()) >= min_distance:
+                    accepted = True
+                    break
+            if not accepted:
+                angle = 2.0 * math.pi * (idx / max(num_slots, 1))
+                candidate = torch.tensor(
+                    [
+                        0.5 + 0.45 * math.cos(angle),
+                        0.5 + 0.45 * math.cos(angle + 2.0 * math.pi / 3.0),
+                        0.5 + 0.45 * math.cos(angle + 4.0 * math.pi / 3.0),
+                    ],
+                    dtype=torch.float32,
+                ).clamp(0.05, 0.95)
+        colors.append(candidate)
+    return torch.stack(colors, dim=0)
+
+
+def build_canvas_from_slot_target(slot_target: torch.Tensor, slot_colors: torch.Tensor) -> torch.Tensor:
+    height, width = slot_target.shape[-2:]
+    canvas = torch.zeros((3, height, width), dtype=torch.float32)
+    for slot_idx in range(slot_colors.shape[0]):
+        mask = slot_target == (slot_idx + 1)
+        if mask.any():
+            canvas[:, mask] = slot_colors[slot_idx].view(3, 1)
+    return canvas
+
+
+def build_prompt_target_canvas(
+    prompt_pseudo_mask: torch.Tensor,
+    slot_index: int,
+    slot_colors: torch.Tensor,
+) -> torch.Tensor:
+    canvas = torch.zeros((3, *prompt_pseudo_mask.shape[-2:]), dtype=torch.float32)
+    if 0 <= slot_index < slot_colors.shape[0]:
+        fg = prompt_pseudo_mask > 0.5
+        if fg.any():
+            canvas[:, fg] = slot_colors[slot_index].view(3, 1)
+    return canvas
 
 
 def resize_mask(mask: torch.Tensor, size: int, mode: str = "nearest") -> torch.Tensor:

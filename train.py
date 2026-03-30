@@ -91,11 +91,11 @@ def main():
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
-        color_min_distance=config.context_painter.color_min_distance,
-        soft_box_sigma=config.context_painter.soft_box_sigma,
-        hint_inner_shrink=config.context_painter.hint_inner_shrink,
-        hint_bg_expand=config.context_painter.hint_bg_expand,
-        grabcut_iters=config.context_painter.grabcut_iters,
+        color_min_distance=config.dense_grounding.random_color_min_distance,
+        soft_box_sigma=0.35,
+        hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
+        hint_bg_expand=config.dense_grounding.hint_bg_expand,
+        grabcut_iters=config.dense_grounding.grabcut_iters,
     )
     val_dataset = PromptEpisodeDataset(
         image_list_path=config.data.val_list,
@@ -110,11 +110,11 @@ def main():
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
-        color_min_distance=config.context_painter.color_min_distance,
-        soft_box_sigma=config.context_painter.soft_box_sigma,
-        hint_inner_shrink=config.context_painter.hint_inner_shrink,
-        hint_bg_expand=config.context_painter.hint_bg_expand,
-        grabcut_iters=config.context_painter.grabcut_iters,
+        color_min_distance=config.dense_grounding.random_color_min_distance,
+        soft_box_sigma=0.35,
+        hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
+        hint_bg_expand=config.dense_grounding.hint_bg_expand,
+        grabcut_iters=config.dense_grounding.grabcut_iters,
     )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist_info["distributed"] else None
@@ -139,13 +139,13 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    model = PromptDET(config.model, config.context_painter).to(device)
+    model = PromptDET(config.model, config.dense_grounding).to(device)
     if dist_info["distributed"]:
         ddp_kwargs = {"broadcast_buffers": False}
         if device.type == "cuda":
             ddp_kwargs.update({"device_ids": [dist_info["local_rank"]], "output_device": dist_info["local_rank"]})
         model = DDP(model, **ddp_kwargs)
-    loss_fn = PromptDetectionLoss(config.model.reg_max, config.loss, config.context_painter)
+    loss_fn = PromptDetectionLoss(config.model.reg_max, config.loss, config.dense_grounding)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.train.lr, weight_decay=config.train.weight_decay)
 
     try:

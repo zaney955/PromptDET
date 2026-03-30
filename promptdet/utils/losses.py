@@ -6,7 +6,7 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 
-from promptdet.config import ContextPainterConfig, LossConfig
+from promptdet.config import DenseGroundingConfig, LossConfig
 
 from .box_ops import bbox2dist, bbox_ciou, bbox_iou
 
@@ -324,11 +324,11 @@ class DFLoss(torch.nn.Module):
 
 
 class PromptDetectionLoss(torch.nn.Module):
-    def __init__(self, reg_max: int, cfg: LossConfig, context_cfg: ContextPainterConfig | None = None):
+    def __init__(self, reg_max: int, cfg: LossConfig, context_cfg: DenseGroundingConfig | None = None):
         super().__init__()
         self.reg_max = reg_max
         self.cfg = cfg
-        self.context_cfg = context_cfg or ContextPainterConfig(enabled=False)
+        self.context_cfg = context_cfg or DenseGroundingConfig(enabled=False)
         self.one2many_assigner = PromptTaskAlignedAssigner(
             cfg.tal_topk,
             cfg.tal_alpha,
@@ -527,6 +527,12 @@ class PromptDetectionLoss(torch.nn.Module):
                         max_prompt_logit_margin_loss(non_target_scores, margin=self.cfg.non_target_logit_margin),
                         region_weights,
                     )
+                non_target_priors = pred_slot_priors[batch_idx][non_target_mask][:, valid_class_mask]
+                if non_target_priors.numel() > 0:
+                    total_box_prior = total_box_prior + 0.25 * weighted_mean(
+                        non_target_priors.max(dim=-1).values,
+                        region_weights,
+                    )
 
             neg_mask = ~assign.fg_mask
             neg_count = int(neg_mask.sum().item())
@@ -577,6 +583,7 @@ class PromptDetectionLoss(torch.nn.Module):
             device = targets[0]["boxes"].device if targets else torch.device("cpu")
             zero = torch.zeros((), device=device)
             return {
+                "loss_canvas": zero,
                 "loss_slot": zero,
                 "loss_fg": zero,
                 "loss_prior_consistency": zero,
@@ -586,6 +593,9 @@ class PromptDetectionLoss(torch.nn.Module):
         fg_logits = context_aux["fg_logits"]
         quality_logits = context_aux["quality_logits"]
         slot_prior_map = context_aux["slot_prior_map"]
+        query_canvas_pred_rgb = context_aux["query_canvas_pred_rgb"]
+        query_canvas_mask = context_aux["query_canvas_mask"]
+        total_canvas = slot_logits.new_tensor(0.0)
         total_slot = slot_logits.new_tensor(0.0)
         total_fg = slot_logits.new_tensor(0.0)
         total_prior = slot_logits.new_tensor(0.0)
@@ -594,6 +604,18 @@ class PromptDetectionLoss(torch.nn.Module):
             dense_slot_target = target["dense_slot_target"]
             dense_fg_target = target["dense_fg_target"]
             dense_valid_mask = target["dense_valid_mask"]
+            query_target_canvas = target["query_target_canvas"]
+
+            canvas_mask = query_canvas_mask[batch_idx].expand_as(query_canvas_pred_rgb[batch_idx]) * dense_valid_mask.unsqueeze(0).float()
+            if canvas_mask.sum() <= 0:
+                canvas_mask = dense_valid_mask.unsqueeze(0).float().expand_as(query_canvas_pred_rgb[batch_idx])
+            canvas_loss = F.smooth_l1_loss(
+                query_canvas_pred_rgb[batch_idx],
+                query_target_canvas,
+                reduction="none",
+                beta=0.02,
+            )
+            total_canvas = total_canvas + (canvas_loss * canvas_mask).sum() / canvas_mask.sum().clamp(min=1.0)
 
             slot_target = dense_slot_target.clone()
             slot_target[~dense_valid_mask] = -1
@@ -629,6 +651,7 @@ class PromptDetectionLoss(torch.nn.Module):
 
         num_batches = max(len(targets), 1)
         return {
+            "loss_canvas": total_canvas / num_batches,
             "loss_slot": total_slot / num_batches,
             "loss_fg": total_fg / num_batches,
             "loss_prior_consistency": total_prior / num_batches,
@@ -666,6 +689,7 @@ class PromptDetectionLoss(torch.nn.Module):
         total_loss = (
             self.cfg.one2many_weight * loss_one2many
             + self.cfg.one2one_weight * loss_one2one
+            + self.context_cfg.canvas_loss_weight * grounding["loss_canvas"]
             + self.context_cfg.slot_loss_weight * grounding["loss_slot"]
             + grounding["loss_fg"]
             + self.context_cfg.prior_consistency_weight * grounding["loss_prior_consistency"]
@@ -675,6 +699,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss": total_loss,
             "loss_one2many": loss_one2many.detach(),
             "loss_one2one": loss_one2one.detach(),
+            "loss_canvas": grounding["loss_canvas"],
             "loss_objectness": one2one["loss_objectness"],
             "loss_targetness": one2one["loss_targetness"],
             "loss_null": one2one["loss_null"],

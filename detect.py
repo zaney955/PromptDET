@@ -8,7 +8,12 @@ from PIL import Image
 import torch
 
 from promptdet.config import load_config
-from promptdet.data.prompt_hints import build_prompt_hint_map
+from promptdet.data.prompt_hints import (
+    build_prompt_hint_map,
+    build_prompt_target_canvas,
+    generate_grabcut_pseudo_mask,
+    sample_slot_colors,
+)
 from promptdet.models.promptdet import PromptDET
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 from promptdet.utils.checkpoint import load_checkpoint
@@ -76,6 +81,8 @@ def _load_prompt_set(
     prompt_types: list[str],
     hint_inner_shrink: float,
     hint_bg_expand: float,
+    grabcut_iters: int,
+    random_color_min_distance: float,
 ):
     if args.prompt_spec:
         prompt_spec_path = Path(args.prompt_spec).resolve()
@@ -95,6 +102,7 @@ def _load_prompt_set(
     prompt_images = []
     prompt_boxes = []
     prompt_hint_maps = []
+    prompt_pseudo_masks = []
     prompt_class_indices = []
     label_to_slot = {}
 
@@ -122,14 +130,23 @@ def _load_prompt_set(
             bbox[1::2] *= image_size / prompt_image.size[1]
             prompt_images.append(resized)
             prompt_boxes.append(bbox)
-            prompt_hint_maps.append(
-                build_prompt_hint_map(
-                    image_size,
-                    bbox,
-                    inner_shrink=hint_inner_shrink,
-                    bg_expand=hint_bg_expand,
-                )
+            hint = build_prompt_hint_map(
+                image_size,
+                bbox,
+                inner_shrink=hint_inner_shrink,
+                bg_expand=hint_bg_expand,
             )
+            prompt_hint_maps.append(hint)
+            pseudo_mask = generate_grabcut_pseudo_mask(
+                resized,
+                bbox,
+                inner_shrink=hint_inner_shrink,
+                bg_expand=hint_bg_expand,
+                iterations=grabcut_iters,
+            )
+            if pseudo_mask is None:
+                pseudo_mask = hint[0]
+            prompt_pseudo_masks.append(pseudo_mask.float())
             prompt_class_indices.append(slot)
 
     if not prompt_images:
@@ -142,15 +159,23 @@ def _load_prompt_set(
     prompt_class_ids = [None] * len(label_to_slot)
     for label, slot in label_to_slot.items():
         prompt_class_ids[slot] = label
+    slot_colors = sample_slot_colors(len(label_to_slot), min_distance=random_color_min_distance)
+    prompt_target_canvases = [
+        build_prompt_target_canvas(mask, int(class_idx), slot_colors)
+        for mask, class_idx in zip(prompt_pseudo_masks, prompt_class_indices)
+    ]
 
     return {
         "prompt_images": torch.stack(prompt_images, dim=0).unsqueeze(0),
         "prompt_boxes": torch.stack(prompt_boxes, dim=0).unsqueeze(0),
         "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0).unsqueeze(0),
+        "prompt_pseudo_masks": torch.stack(prompt_pseudo_masks, dim=0).unsqueeze(0),
+        "prompt_target_canvases": torch.stack(prompt_target_canvases, dim=0).unsqueeze(0),
         "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long).unsqueeze(0),
         "prompt_instance_mask": torch.ones((1, len(prompt_images)), dtype=torch.bool),
         "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long).unsqueeze(0),
         "prompt_class_mask": torch.ones((1, len(prompt_class_ids)), dtype=torch.bool),
+        "slot_colors": slot_colors.unsqueeze(0),
         "prompt_type": torch.tensor([prompt_types.index(task_type)], dtype=torch.long),
     }
 
@@ -177,6 +202,8 @@ def _run_single_query(
             prompt_batch["prompt_images"].to(device),
             prompt_batch["prompt_boxes"].to(device),
             prompt_batch["prompt_hint_maps"].to(device),
+            prompt_batch["prompt_pseudo_masks"].to(device),
+            prompt_batch["prompt_target_canvases"].to(device),
             prompt_batch["prompt_class_indices"].to(device),
             prompt_batch["prompt_instance_mask"].to(device),
             prompt_batch["prompt_class_mask"].to(device),
@@ -228,7 +255,7 @@ def main():
         config.train.max_det = args.max_det
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
 
-    model = PromptDET(config.model, config.context_painter).to(device)
+    model = PromptDET(config.model, config.dense_grounding).to(device)
     load_checkpoint(args.checkpoint, model, map_location=device.type)
     model.eval()
     model.set_context_prior_strength(1.0)
@@ -238,8 +265,10 @@ def main():
         config.model.image_size,
         config.model.max_prompt_classes,
         config.model.prompt_types,
-        config.context_painter.hint_inner_shrink,
-        config.context_painter.hint_bg_expand,
+        config.dense_grounding.hint_inner_shrink,
+        config.dense_grounding.hint_bg_expand,
+        config.dense_grounding.grabcut_iters,
+        config.dense_grounding.random_color_min_distance,
     )
     query_path = Path(args.query_image).resolve()
     query_images = _iter_query_images(query_path)
@@ -277,13 +306,18 @@ def main():
             encoding="utf-8",
         )
         if grounding_aux is not None:
-            save_grounding_visualizations(grounding_aux, current_output_dir)
+            save_grounding_visualizations(
+                grounding_aux,
+                current_output_dir,
+                prompt_canvases=prompt_batch["prompt_target_canvases"][0],
+            )
             (current_output_dir / "grounding_debug.json").write_text(
                 json.dumps(
                     {
                         "query_image": str(current_query_path),
                         "task_type": config.model.prompt_types[int(prompt_batch["prompt_type"][0].item())],
                         "num_prompts": int(prompt_batch["prompt_images"].shape[1]),
+                        "slot_colors": prompt_batch["slot_colors"][0].tolist(),
                     },
                     ensure_ascii=False,
                     indent=2,

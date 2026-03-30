@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from promptdet.config import ContextPainterConfig, ModelConfig
+from promptdet.config import DenseGroundingConfig, ModelConfig
 from promptdet.utils.box_ops import clamp_boxes, dist2bbox, make_anchors
 
 from .backbone import PromptDetBackbone
@@ -31,10 +31,10 @@ def oversize_box_penalty(boxes: torch.Tensor, image_size: int, area_threshold: f
 
 
 class PromptDET(nn.Module):
-    def __init__(self, cfg: ModelConfig, context_cfg: ContextPainterConfig | None = None):
+    def __init__(self, cfg: ModelConfig, context_cfg: DenseGroundingConfig | None = None):
         super().__init__()
         self.cfg = cfg
-        self.context_cfg = context_cfg or ContextPainterConfig(enabled=False)
+        self.context_cfg = context_cfg or DenseGroundingConfig(enabled=False)
         self.backbone = PromptDetBackbone(cfg.backbone_widths)
         self.neck = PromptDetNeck(self.backbone.out_channels, cfg.neck_channels)
         self.grounder = BBoxPromptGrounder(
@@ -42,6 +42,7 @@ class PromptDET(nn.Module):
             prompt_dim=cfg.prompt_dim,
             max_prompt_classes=cfg.max_prompt_classes,
             prompt_types=cfg.prompt_types,
+            image_size=cfg.image_size,
             cfg=self.context_cfg,
         )
         self.head = PromptDetectHead(cfg.neck_channels, cfg.reg_max, cfg.prompt_dim)
@@ -49,8 +50,7 @@ class PromptDET(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(cfg.logit_scale_init))
         self.context_prior_strength = 1.0
         self.slot_prior_logit_scale = nn.Parameter(torch.tensor(1.0))
-        self.null_class_prototype = nn.Parameter(torch.randn(cfg.prompt_dim))
-        self.null_class_detail = nn.Parameter(torch.randn(cfg.prompt_dim))
+        self.null_memory = nn.Parameter(torch.randn(self.context_cfg.slot_memory_tokens, cfg.prompt_dim))
 
     def set_context_prior_strength(self, strength: float) -> None:
         self.context_prior_strength = float(strength)
@@ -60,13 +60,17 @@ class PromptDET(nn.Module):
         prompt_images: torch.Tensor,
         prompt_boxes: torch.Tensor,
         prompt_hint_maps: torch.Tensor,
+        prompt_pseudo_masks: torch.Tensor,
+        prompt_target_canvases: torch.Tensor,
         prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
         query_image: torch.Tensor,
         prompt_type: torch.Tensor,
+        query_target_canvas: torch.Tensor | None = None,
         decode: bool = False,
     ) -> Dict[str, Dict[str, List[torch.Tensor]]] | Dict[str, Dict[str, torch.Tensor]]:
+        del prompt_boxes, prompt_hint_maps
         batch_size, num_instances = prompt_images.shape[:2]
         flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous()
         query_image = query_image.contiguous()
@@ -78,13 +82,14 @@ class PromptDET(nn.Module):
         query_feats = self.neck(self.backbone(query_image))
         grounding = self.grounder(
             prompt_feats,
-            prompt_hint_maps,
+            prompt_target_canvases,
+            prompt_pseudo_masks,
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
             query_feats,
+            query_target_canvas,
             prompt_type,
-            image_size=query_image.shape[-1],
         )
         branches = self.head(
             grounding["fused_feats"],
@@ -94,8 +99,7 @@ class PromptDET(nn.Module):
         max_scale = math.exp(self.cfg.max_logit_scale)
         logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         for branch in branches.values():
-            branch["class_prototypes"] = grounding["class_prototypes"]
-            branch["class_detail_tokens"] = grounding["class_detail_tokens"]
+            branch["slot_memory"] = grounding["slot_memory"]
             branch["class_mask"] = grounding["class_mask"]
             branch["logit_scale"] = logit_scale
         branches["context_aux"] = {
@@ -103,6 +107,9 @@ class PromptDET(nn.Module):
             "fg_logits": grounding["fg_logits"],
             "quality_logits": grounding["quality_logits"],
             "slot_prior_map": grounding["slot_prior_map"],
+            "query_canvas_pred_rgb": grounding["query_canvas_pred_rgb"],
+            "query_canvas_mask": grounding["query_canvas_mask"],
+            "masked_query_canvas_rgb": grounding["masked_query_canvas_rgb"],
         }
         if decode:
             return self.decode_raw(branches)
@@ -114,8 +121,7 @@ class PromptDET(nn.Module):
         targetness_logits = outputs["targetness_logits"]
         class_embeddings = outputs["class_embeddings"]
         slot_prior_maps = outputs.get("slot_prior_maps", [])
-        class_prototypes = outputs["class_prototypes"]
-        class_detail_tokens = outputs["class_detail_tokens"]
+        slot_memory = outputs["slot_memory"]
         class_mask = outputs["class_mask"]
         logit_scale = outputs["logit_scale"]
 
@@ -131,10 +137,8 @@ class PromptDET(nn.Module):
         stride_parts = []
         prior_parts = []
         flat_box_logits = []
-        class_prototypes = F.normalize(class_prototypes, dim=-1)
-        class_detail_tokens = F.normalize(class_detail_tokens, dim=-1)
-        null_proto = F.normalize(self.null_class_prototype, dim=0)
-        null_detail = F.normalize(self.null_class_detail, dim=0)
+        slot_memory = F.normalize(slot_memory, dim=-1)
+        null_memory = F.normalize(self.null_memory, dim=-1)
         null_parts = []
         for level_idx, (box_logit, objectness_logit, targetness_logit, class_embedding, stride) in enumerate(zip(
             box_logits,
@@ -156,14 +160,7 @@ class PromptDET(nn.Module):
             flat_targetness = targetness_logit.flatten(2).transpose(1, 2).squeeze(-1)
             targetness_parts.append(flat_targetness)
             flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1)
-            global_scores = torch.einsum("bnd,bkd->bnk", flat_embeddings, class_prototypes)
-            detail_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, class_detail_tokens).max(dim=-1).values
-            null_global = torch.einsum("bnd,d->bn", flat_embeddings, null_proto)
-            null_detail_scores = torch.einsum("bnd,d->bn", flat_embeddings, null_detail)
-            level_scores = (
-                (1.0 - self.cfg.detail_score_weight) * global_scores
-                + self.cfg.detail_score_weight * detail_scores
-            ) * logit_scale
+            level_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, slot_memory).max(dim=-1).values * logit_scale
             if slot_prior_maps:
                 flat_slot_prior = slot_prior_maps[level_idx].flatten(2).transpose(1, 2)
                 cls_prior = flat_slot_prior[:, :, 1:]
@@ -176,10 +173,7 @@ class PromptDET(nn.Module):
                 prior_parts.append(cls_prior)
             else:
                 prior_parts.append(level_scores.new_ones(level_scores.shape))
-            level_null = (
-                (1.0 - self.cfg.detail_score_weight) * null_global
-                + self.cfg.detail_score_weight * null_detail_scores
-            ) * logit_scale
+            level_null = torch.einsum("bnd,td->bnt", flat_embeddings, null_memory).max(dim=-1).values * logit_scale
             level_scores = level_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
             score_parts.append(level_scores)
             null_parts.append(level_null)

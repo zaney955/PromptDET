@@ -11,9 +11,12 @@ import torch
 from torch.utils.data import Dataset
 
 from promptdet.data.prompt_hints import (
+    build_canvas_from_slot_target,
+    build_prompt_target_canvas,
     build_prompt_hint_map,
     build_query_dense_targets,
     generate_grabcut_pseudo_mask,
+    sample_slot_colors,
 )
 from promptdet.data.yolo_io import load_class_names, load_image_list, parse_yolo_label_file
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
@@ -80,6 +83,7 @@ class PromptEpisodeDataset(Dataset):
         self.hint_inner_shrink = hint_inner_shrink
         self.hint_bg_expand = hint_bg_expand
         self.grabcut_iters = grabcut_iters
+        self.color_min_distance = color_min_distance
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -272,6 +276,7 @@ class PromptEpisodeDataset(Dataset):
         prompt_boxes = []
         prompt_hint_maps = []
         prompt_pseudo_masks = []
+        prompt_target_canvases = []
         prompt_class_indices = []
         for instance in prompt_instances:
             image = self._load_image(instance["image_id"])
@@ -345,14 +350,20 @@ class PromptEpisodeDataset(Dataset):
             bg_expand=self.hint_bg_expand,
             grabcut_iters=self.grabcut_iters,
         )
+        slot_colors = sample_slot_colors(len(sampled_prompt_class_ids), min_distance=self.color_min_distance)
+        for pseudo_mask, class_slot in zip(prompt_pseudo_masks, prompt_class_indices):
+            prompt_target_canvases.append(build_prompt_target_canvas(pseudo_mask, class_slot, slot_colors))
+        query_target_canvas = build_canvas_from_slot_target(query_dense_slot_target, slot_colors)
 
         return {
             "prompt_images": torch.stack(prompt_images, dim=0),
             "prompt_boxes": torch.stack(prompt_boxes, dim=0),
             "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0),
             "prompt_pseudo_masks": torch.stack(prompt_pseudo_masks, dim=0),
+            "prompt_target_canvases": torch.stack(prompt_target_canvases, dim=0),
             "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long),
             "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long),
+            "slot_colors": slot_colors,
             "prompt_type": torch.tensor(prompt_type_id, dtype=torch.long),
             "query_image": query_image_tensor,
             "query_boxes": query_boxes_tensor,
@@ -361,6 +372,7 @@ class PromptEpisodeDataset(Dataset):
             "query_dense_slot_target": query_dense_slot_target,
             "query_dense_fg_target": query_dense_fg_target,
             "query_dense_valid_mask": query_dense_valid_mask,
+            "query_target_canvas": query_target_canvas,
             "query_pseudo_masks": query_pseudo_masks,
             "query_non_target_boxes": non_target_boxes_tensor,
             "query_non_target_weights": non_target_weights_tensor,
@@ -379,10 +391,12 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
     prompt_boxes = torch.zeros((batch_size, max_prompt_instances, 4), dtype=torch.float32)
     prompt_hint_maps = torch.zeros((batch_size, max_prompt_instances, 3, height, width), dtype=torch.float32)
     prompt_pseudo_masks = torch.zeros((batch_size, max_prompt_instances, height, width), dtype=torch.float32)
+    prompt_target_canvases = torch.zeros((batch_size, max_prompt_instances, 3, height, width), dtype=torch.float32)
     prompt_class_indices = torch.zeros((batch_size, max_prompt_instances), dtype=torch.long)
     prompt_instance_mask = torch.zeros((batch_size, max_prompt_instances), dtype=torch.bool)
     prompt_class_ids = torch.full((batch_size, max_prompt_classes), -1, dtype=torch.long)
     prompt_class_mask = torch.zeros((batch_size, max_prompt_classes), dtype=torch.bool)
+    slot_colors = torch.zeros((batch_size, max_prompt_classes, 3), dtype=torch.float32)
 
     for batch_idx, item in enumerate(batch):
         num_instances = item["prompt_images"].shape[0]
@@ -391,22 +405,27 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         prompt_boxes[batch_idx, :num_instances] = item["prompt_boxes"]
         prompt_hint_maps[batch_idx, :num_instances] = item["prompt_hint_maps"]
         prompt_pseudo_masks[batch_idx, :num_instances] = item["prompt_pseudo_masks"]
+        prompt_target_canvases[batch_idx, :num_instances] = item["prompt_target_canvases"]
         prompt_class_indices[batch_idx, :num_instances] = item["prompt_class_indices"]
         prompt_instance_mask[batch_idx, :num_instances] = True
         prompt_class_ids[batch_idx, :num_classes] = item["prompt_class_ids"]
         prompt_class_mask[batch_idx, :num_classes] = True
+        slot_colors[batch_idx, :num_classes] = item["slot_colors"]
 
     return {
         "prompt_images": prompt_images,
         "prompt_boxes": prompt_boxes,
         "prompt_hint_maps": prompt_hint_maps,
         "prompt_pseudo_masks": prompt_pseudo_masks,
+        "prompt_target_canvases": prompt_target_canvases,
         "prompt_class_indices": prompt_class_indices,
         "prompt_instance_mask": prompt_instance_mask,
         "prompt_class_ids": prompt_class_ids,
         "prompt_class_mask": prompt_class_mask,
+        "slot_colors": slot_colors,
         "prompt_type": torch.stack([item["prompt_type"] for item in batch], dim=0),
         "query_image": torch.stack([item["query_image"] for item in batch], dim=0),
+        "query_target_canvas": torch.stack([item["query_target_canvas"] for item in batch], dim=0),
         "targets": [
             {
                 "boxes": item["query_boxes"],
@@ -415,6 +434,7 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
                 "dense_slot_target": item["query_dense_slot_target"],
                 "dense_fg_target": item["query_dense_fg_target"],
                 "dense_valid_mask": item["query_dense_valid_mask"],
+                "query_target_canvas": item["query_target_canvas"],
                 "query_pseudo_masks": item["query_pseudo_masks"],
                 "non_target_boxes": item["query_non_target_boxes"],
                 "non_target_weights": item["query_non_target_weights"],

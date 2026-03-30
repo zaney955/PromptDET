@@ -11,13 +11,14 @@ Prompt labels are episode-local identity tokens used to group prompt instances i
 
 The implementation combines:
 
-- SegGPT-style prompt-conditioned support/query interaction
+- SegGPT-style dense in-context grounding with box-derived prompt targets
 - YOLO-style multi-scale dense detection
 - DFL-based box regression
 - dual detection heads:
   - `one2many` for dense auxiliary supervision during training
   - `one2one` for unique-matching final inference
-- quality-aware matching and NMS-free `one2one` inference with local peak filtering and oversize-box suppression
+- prompt slot memory for classification instead of fixed closed-set heads
+- dense canvas reconstruction, slot priors, and NMS-free `one2one` inference with local peak filtering and oversize-box suppression
 
 ## Project Layout
 
@@ -100,6 +101,14 @@ Sampling behavior is controlled in `configs/toy_train.json`:
 - `data.negative_ratio`
 - `data.hard_negative_ratio`
 
+Dense grounding behavior is controlled in `configs/toy_train.json` under `dense_grounding`:
+
+- `dense_grounding.slot_memory_tokens`
+- `dense_grounding.query_mask_ratio`
+- `dense_grounding.canvas_loss_weight`
+- `dense_grounding.feature_ensemble_start`
+- `dense_grounding.random_color_min_distance`
+
 ## Inference
 
 Single-prompt compatibility mode:
@@ -176,8 +185,10 @@ Outputs:
 
 - `prediction.json`
 - `prediction.png`
-- `fg_prior.png`
-- `slot_prior_argmax.png`
+- `grounding_fg.png`
+- `dense_slot_argmax.png`
+- `prompt_canvas.png`
+- `query_canvas_recon.png`
 
 ## Detection Behavior
 
@@ -200,9 +211,10 @@ Implemented:
 - full modular prompt-conditioned detector with prompt-set episodes
 - shared backbone and PAN/FPN neck
 - bbox-first prompt hint maps with trimap-style seeds
-- full-image prompt/query joint grounding with feature-ensemble query aggregation
+- box-derived prompt pseudo masks and random slot-colored prompt/query target canvases
+- SegGPT-style dense prompt/query context painter with feature-ensemble query aggregation
 - dense slot / foreground grounding priors driving the detection head
-- prompt-class prototype aggregation from full-image masked prompt features
+- prompt slot memory aggregation from full-image masked prompt features
 - dual-branch dense detection head with DFL regression
 - prompt-conditioned targetness prediction
 - explicit null competition against prompt classes during scoring
