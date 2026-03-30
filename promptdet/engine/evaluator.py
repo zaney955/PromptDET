@@ -31,11 +31,10 @@ def evaluate(
     for batch in dataloader:
         prompt_images = batch["prompt_images"].to(device)
         prompt_boxes = batch["prompt_boxes"].to(device)
-        prompt_canvas = batch["prompt_canvas"].to(device)
+        prompt_hint_maps = batch["prompt_hint_maps"].to(device)
         prompt_class_indices = batch["prompt_class_indices"].to(device)
         prompt_instance_mask = batch["prompt_instance_mask"].to(device)
         prompt_class_ids = batch["prompt_class_ids"].to(device)
-        context_colors = batch["context_colors"].to(device)
         prompt_class_mask = batch["prompt_class_mask"].to(device)
         prompt_type = batch["prompt_type"].to(device)
         query_image = batch["query_image"].to(device)
@@ -43,11 +42,10 @@ def evaluate(
         raw = model(
             prompt_images,
             prompt_boxes,
+            prompt_hint_maps,
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
-            prompt_canvas,
-            context_colors,
             query_image,
             prompt_type,
         )

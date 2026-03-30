@@ -93,6 +93,9 @@ def main():
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
         color_min_distance=config.context_painter.color_min_distance,
         soft_box_sigma=config.context_painter.soft_box_sigma,
+        hint_inner_shrink=config.context_painter.hint_inner_shrink,
+        hint_bg_expand=config.context_painter.hint_bg_expand,
+        grabcut_iters=config.context_painter.grabcut_iters,
     )
     val_dataset = PromptEpisodeDataset(
         image_list_path=config.data.val_list,
@@ -109,6 +112,9 @@ def main():
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
         color_min_distance=config.context_painter.color_min_distance,
         soft_box_sigma=config.context_painter.soft_box_sigma,
+        hint_inner_shrink=config.context_painter.hint_inner_shrink,
+        hint_bg_expand=config.context_painter.hint_bg_expand,
+        grabcut_iters=config.context_painter.grabcut_iters,
     )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist_info["distributed"] else None
@@ -134,8 +140,6 @@ def main():
     )
 
     model = PromptDET(config.model, config.context_painter).to(device)
-    if device.type == "cuda":
-        model = model.to(memory_format=torch.channels_last)
     if dist_info["distributed"]:
         ddp_kwargs = {"broadcast_buffers": False}
         if device.type == "cuda":

@@ -67,3 +67,35 @@ def save_context_prior_visualizations(
             color_canvas[:, mask] = colors[slot_idx - 1].view(3, 1)
     color_canvas = (color_canvas.permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
     Image.fromarray(color_canvas, mode="RGB").save(output_dir / "slot_prior_argmax.png")
+
+
+def save_grounding_visualizations(
+    grounding_aux: Dict[str, torch.Tensor],
+    output_dir: str | Path,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fg_prob = grounding_aux["fg_logits"][0].sigmoid().detach().cpu().squeeze(0)
+    Image.fromarray(fg_prob.clamp(0.0, 1.0).mul(255).byte().numpy(), mode="L").save(output_dir / "grounding_fg.png")
+
+    slot_logits = grounding_aux["slot_logits"][0].detach().cpu()
+    slot_pred = slot_logits.argmax(dim=0)
+    num_slots = int(slot_logits.shape[0] - 1)
+    palette = np.zeros((num_slots + 1, 3), dtype=np.uint8)
+    base_colors = np.array(
+        [
+            [0, 0, 0],
+            [255, 80, 80],
+            [80, 200, 255],
+            [120, 255, 120],
+            [255, 220, 80],
+            [220, 120, 255],
+        ],
+        dtype=np.uint8,
+    )
+    palette[: min(len(palette), len(base_colors))] = base_colors[: min(len(palette), len(base_colors))]
+    for idx in range(len(base_colors), len(palette)):
+        palette[idx] = np.array([(37 * idx) % 255, (97 * idx) % 255, (181 * idx) % 255], dtype=np.uint8)
+    slot_rgb = palette[slot_pred.numpy()]
+    Image.fromarray(slot_rgb, mode="RGB").save(output_dir / "grounding_slot.png")

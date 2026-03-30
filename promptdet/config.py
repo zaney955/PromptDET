@@ -16,6 +16,8 @@ class ModelConfig:
     prompt_dim: int = 256
     reg_max: int = 16
     num_attention_heads: int = 8
+    grounding_dim: int = 192
+    grounding_depth: int = 4
     prompt_crop_size: int = 128
     label_dropout: float = 0.4
     logit_scale_init: float = 1.5
@@ -27,17 +29,25 @@ class ModelConfig:
 @dataclass
 class ContextPainterConfig:
     enabled: bool = True
-    scale: str = "p4"
+    scale: str = "p3"
     dim: int = 256
-    depth: int = 6
+    depth: int = 4
     num_heads: int = 8
     feature_ensemble_start: int = 2
-    recon_weight: float = 0.5
+    recon_weight: float = 0.0
     prior_weight: float = 1.0
     prior_warmup_ratio: float = 0.1
     color_min_distance: float = 0.45
     soft_box_sigma: float = 0.35
     color_temperature: float = 10.0
+    hint_inner_shrink: float = 0.6
+    hint_bg_expand: float = 0.12
+    grabcut_iters: int = 2
+    prior_threshold: float = 0.15
+    slot_loss_weight: float = 1.5
+    fg_bce_weight: float = 1.0
+    fg_dice_weight: float = 1.0
+    prior_consistency_weight: float = 0.5
 
 
 @dataclass

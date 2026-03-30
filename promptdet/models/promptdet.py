@@ -11,12 +11,9 @@ from promptdet.config import ContextPainterConfig, ModelConfig
 from promptdet.utils.box_ops import clamp_boxes, dist2bbox, make_anchors
 
 from .backbone import PromptDetBackbone
-from .common import ConvBNAct
-from .context_painter import ContextPainter
-from .fusion import PromptFusionNeck
+from .bbox_grounder import BBoxPromptGrounder
 from .head import PromptDetectHead
 from .neck import PromptDetNeck
-from .prompt_encoder import PromptEncoder
 
 
 def oversize_box_penalty(boxes: torch.Tensor, image_size: int, area_threshold: float) -> torch.Tensor:
@@ -40,15 +37,13 @@ class PromptDET(nn.Module):
         self.context_cfg = context_cfg or ContextPainterConfig(enabled=False)
         self.backbone = PromptDetBackbone(cfg.backbone_widths)
         self.neck = PromptDetNeck(self.backbone.out_channels, cfg.neck_channels)
-        self.prompt_encoder = PromptEncoder(
+        self.grounder = BBoxPromptGrounder(
+            channels=cfg.neck_channels,
             prompt_dim=cfg.prompt_dim,
-            out_channels=cfg.neck_channels,
-            crop_size=cfg.prompt_crop_size,
-            prompt_types=cfg.prompt_types,
-            label_dropout=cfg.label_dropout,
             max_prompt_classes=cfg.max_prompt_classes,
+            prompt_types=cfg.prompt_types,
+            cfg=self.context_cfg,
         )
-        self.fusion = PromptFusionNeck(cfg.neck_channels, cfg.prompt_dim, cfg.num_attention_heads)
         self.head = PromptDetectHead(cfg.neck_channels, cfg.reg_max, cfg.prompt_dim)
         self.register_buffer("proj_bins", torch.arange(cfg.reg_max, dtype=torch.float32), persistent=False)
         self.logit_scale = nn.Parameter(torch.tensor(cfg.logit_scale_init))
@@ -56,144 +51,61 @@ class PromptDET(nn.Module):
         self.slot_prior_logit_scale = nn.Parameter(torch.tensor(1.0))
         self.null_class_prototype = nn.Parameter(torch.randn(cfg.prompt_dim))
         self.null_class_detail = nn.Parameter(torch.randn(cfg.prompt_dim))
-        self.context_scale = self.context_cfg.scale
-        if self.context_cfg.enabled:
-            self.context_painter = ContextPainter(
-                in_channels=cfg.neck_channels,
-                image_size=cfg.image_size,
-                prompt_types=cfg.prompt_types,
-                cfg=self.context_cfg,
-            )
-            self.context_feature_fuse = ConvBNAct(cfg.neck_channels * 2, cfg.neck_channels, 3)
-        else:
-            self.context_painter = None
-            self.context_feature_fuse = None
 
     def set_context_prior_strength(self, strength: float) -> None:
         self.context_prior_strength = float(strength)
-
-    def _build_context_aux(
-        self,
-        query_canvas_pred_rgb: torch.Tensor,
-        query_context_feat: torch.Tensor,
-        context_colors: torch.Tensor,
-        prompt_class_mask: torch.Tensor,
-        feat_pyramid: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        batch_size = prompt_class_mask.shape[0]
-        device = query_canvas_pred_rgb.device
-        padded_mask = torch.zeros(
-            (batch_size, self.cfg.max_prompt_classes),
-            dtype=torch.bool,
-            device=device,
-        )
-        padded_colors = torch.zeros(
-            (batch_size, self.cfg.max_prompt_classes, 3),
-            dtype=query_canvas_pred_rgb.dtype,
-            device=device,
-        )
-        limit = min(prompt_class_mask.shape[1], self.cfg.max_prompt_classes)
-        padded_mask[:, :limit] = prompt_class_mask[:, :limit].to(device)
-        padded_colors[:, :limit] = context_colors[:, :limit].to(device)
-        bg_colors = torch.zeros((batch_size, 1, 3, 1, 1), dtype=query_canvas_pred_rgb.dtype, device=device)
-        slot_colors = padded_colors.unsqueeze(-1).unsqueeze(-1)
-        all_colors = torch.cat([bg_colors, slot_colors], dim=1)
-        color_logits = -(query_canvas_pred_rgb.unsqueeze(1) - all_colors).abs().mean(dim=2) * self.context_cfg.color_temperature
-        valid_mask = torch.cat(
-            [
-                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
-                padded_mask,
-            ],
-            dim=1,
-        )
-        color_logits = color_logits.masked_fill(~valid_mask.unsqueeze(-1).unsqueeze(-1), -1e4)
-        slot_prior_map = color_logits.softmax(dim=1)
-        slot_prior_pyramid = {
-            name: F.interpolate(slot_prior_map, size=feat.shape[-2:], mode="bilinear", align_corners=False)
-            for name, feat in feat_pyramid.items()
-        }
-        fg_prior_pyramid = {
-            name: 1.0 - prior[:, :1]
-            for name, prior in slot_prior_pyramid.items()
-        }
-        return {
-            "query_canvas_pred_rgb": query_canvas_pred_rgb,
-            "query_context_feat": query_context_feat,
-            "slot_prior_logits": color_logits,
-            "slot_prior_map": slot_prior_map,
-            "slot_prior_pyramid": slot_prior_pyramid,
-            "fg_prior_pyramid": fg_prior_pyramid,
-        }
 
     def forward(
         self,
         prompt_images: torch.Tensor,
         prompt_boxes: torch.Tensor,
+        prompt_hint_maps: torch.Tensor,
         prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
-        prompt_canvas: torch.Tensor | None,
-        context_colors: torch.Tensor | None,
         query_image: torch.Tensor,
         prompt_type: torch.Tensor,
-    ) -> Dict[str, Dict[str, List[torch.Tensor]]]:
+        decode: bool = False,
+    ) -> Dict[str, Dict[str, List[torch.Tensor]]] | Dict[str, Dict[str, torch.Tensor]]:
         batch_size, num_instances = prompt_images.shape[:2]
-        flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous(
-            memory_format=torch.channels_last
-        )
-        query_image = query_image.contiguous(memory_format=torch.channels_last)
+        flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous()
+        query_image = query_image.contiguous()
         flat_prompt_feats = self.neck(self.backbone(flat_prompt_images))
         prompt_feats = {
             name: feat.view(batch_size, num_instances, *feat.shape[1:])
             for name, feat in flat_prompt_feats.items()
         }
         query_feats = self.neck(self.backbone(query_image))
-        context_aux = None
-        if (
-            self.context_painter is not None
-            and prompt_canvas is not None
-            and context_colors is not None
-        ):
-            context_raw = self.context_painter(
-                prompt_feats[self.context_scale],
-                prompt_canvas,
-                prompt_instance_mask,
-                query_feats[self.context_scale],
-                prompt_type,
-            )
-            context_aux = self._build_context_aux(
-                context_raw["query_canvas_pred_rgb"],
-                context_raw["query_context_feat"],
-                context_colors,
-                prompt_class_mask,
-                query_feats,
-            )
-            query_feats[self.context_scale] = self.context_feature_fuse(
-                torch.cat([query_feats[self.context_scale], context_aux["query_context_feat"]], dim=1)
-            )
-        prompt = self.prompt_encoder(
-            prompt_images,
-            prompt_boxes,
+        grounding = self.grounder(
             prompt_feats,
+            prompt_hint_maps,
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
+            query_feats,
             prompt_type,
+            image_size=query_image.shape[-1],
         )
-        fused = self.fusion(query_feats, prompt)
         branches = self.head(
-            fused,
-            fg_prior_pyramid=context_aux["fg_prior_pyramid"] if context_aux is not None else None,
-            slot_prior_pyramid=context_aux["slot_prior_pyramid"] if context_aux is not None else None,
+            grounding["fused_feats"],
+            fg_prior_pyramid=grounding["fg_prior_pyramid"],
+            slot_prior_pyramid=grounding["slot_prior_pyramid"],
         )
         max_scale = math.exp(self.cfg.max_logit_scale)
         logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         for branch in branches.values():
-            branch["class_prototypes"] = prompt["class_prototypes"]
-            branch["class_detail_tokens"] = prompt["class_detail_tokens"]
-            branch["class_mask"] = prompt["class_mask"]
+            branch["class_prototypes"] = grounding["class_prototypes"]
+            branch["class_detail_tokens"] = grounding["class_detail_tokens"]
+            branch["class_mask"] = grounding["class_mask"]
             branch["logit_scale"] = logit_scale
-        branches["context_aux"] = context_aux
+        branches["context_aux"] = {
+            "slot_logits": grounding["slot_logits"],
+            "fg_logits": grounding["fg_logits"],
+            "quality_logits": grounding["quality_logits"],
+            "slot_prior_map": grounding["slot_prior_map"],
+        }
+        if decode:
+            return self.decode_raw(branches)
         return branches
 
     def _decode_branch(self, outputs: Dict[str, List[torch.Tensor]]) -> Dict[str, torch.Tensor]:

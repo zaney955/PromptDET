@@ -18,7 +18,7 @@
     "enabled": true,
     "scale": "p4",
     "dim": 256,
-    "depth": 6,
+    "depth": 2,
     "num_heads": 8,
     "feature_ensemble_start": 2,
     "recon_weight": 0.5,
@@ -46,7 +46,7 @@
   },
   "train": {
     "output_dir": "./outputs/toy_run",
-    "batch_size": 8,
+    "batch_size": 1,
     "epochs": 20,
     "lr": 0.0003,
     "weight_decay": 0.0001,

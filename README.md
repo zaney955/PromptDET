@@ -199,18 +199,18 @@ Implemented:
 
 - full modular prompt-conditioned detector with prompt-set episodes
 - shared backbone and PAN/FPN neck
-- prompt crop encoder with multi-instance class prototype aggregation
-- SegGPT-style context canvas rendering with random episode-local colors
-- `ContextPainter` dense in-context prior branch on `P4`
-- feature-ensemble query aggregation across multiple prompt instances
-- cross-attention prompt/query fusion with null-aware gating
+- bbox-first prompt hint maps with trimap-style seeds
+- full-image prompt/query joint grounding with feature-ensemble query aggregation
+- dense slot / foreground grounding priors driving the detection head
+- prompt-class prototype aggregation from full-image masked prompt features
 - dual-branch dense detection head with DFL regression
 - prompt-conditioned targetness prediction
 - explicit null competition against prompt classes during scoring
-- dense slot-prior / foreground-prior injection into the detection head
+- grounding-aware positive assignment
 - dynamic prompt-class assignment
 - `one2one` unique matching with duplicate suppression supervision
 - local peak filtering for NMS-free `one2one` inference
+- bbox-derived dense supervision with GrabCut pseudo-mask fallback
 - training and validation loops
 - single-node distributed training with DDP
 - standalone inference script
@@ -218,8 +218,6 @@ Implemented:
 
 Not yet implemented:
 
-- multi-prompt inference pool
-- same-instance mode
 - text prompt encoder
 
 ## Dataset Format
