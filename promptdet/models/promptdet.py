@@ -12,8 +12,10 @@ from promptdet.utils.box_ops import clamp_boxes, dist2bbox, make_anchors
 
 from .backbone import PromptDetBackbone
 from .bbox_grounder import BBoxPromptGrounder
+from .fusion import PromptFusionNeck
 from .head import PromptDetectHead
 from .neck import PromptDetNeck
+from .prompt_encoder import PromptEncoder
 
 
 def oversize_box_penalty(boxes: torch.Tensor, image_size: int, area_threshold: float) -> torch.Tensor:
@@ -37,6 +39,15 @@ class PromptDET(nn.Module):
         self.context_cfg = context_cfg or DenseGroundingConfig(enabled=False)
         self.backbone = PromptDetBackbone(cfg.backbone_widths)
         self.neck = PromptDetNeck(self.backbone.out_channels, cfg.neck_channels)
+        self.prompt_encoder = PromptEncoder(
+            prompt_dim=cfg.prompt_dim,
+            out_channels=cfg.neck_channels,
+            crop_size=cfg.prompt_crop_size,
+            prompt_types=cfg.prompt_types,
+            label_dropout=cfg.label_dropout,
+            max_prompt_classes=cfg.max_prompt_classes,
+        )
+        self.prompt_fusion = PromptFusionNeck(cfg.neck_channels, cfg.prompt_dim, cfg.num_attention_heads)
         self.grounder = BBoxPromptGrounder(
             channels=cfg.neck_channels,
             prompt_dim=cfg.prompt_dim,
@@ -60,17 +71,15 @@ class PromptDET(nn.Module):
         prompt_images: torch.Tensor,
         prompt_boxes: torch.Tensor,
         prompt_hint_maps: torch.Tensor,
-        prompt_pseudo_masks: torch.Tensor,
-        prompt_target_canvases: torch.Tensor,
+        prompt_target_maps: torch.Tensor,
         prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
         query_image: torch.Tensor,
         prompt_type: torch.Tensor,
-        query_target_canvas: torch.Tensor | None = None,
+        query_target_map: torch.Tensor | None = None,
         decode: bool = False,
     ) -> Dict[str, Dict[str, List[torch.Tensor]]] | Dict[str, Dict[str, torch.Tensor]]:
-        del prompt_boxes, prompt_hint_maps
         batch_size, num_instances = prompt_images.shape[:2]
         flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous()
         query_image = query_image.contiguous()
@@ -80,17 +89,35 @@ class PromptDET(nn.Module):
             for name, feat in flat_prompt_feats.items()
         }
         query_feats = self.neck(self.backbone(query_image))
-        grounding = self.grounder(
+        prompt_encoding = self.prompt_encoder(
+            prompt_images,
+            prompt_boxes,
             prompt_feats,
-            prompt_target_canvases,
-            prompt_pseudo_masks,
+            prompt_class_indices,
+            prompt_instance_mask,
+            prompt_class_mask,
+            prompt_type,
+        )
+        query_feats = self.prompt_fusion(query_feats, prompt_encoding)
+        grounding = self.grounder(
+            prompt_boxes,
+            prompt_hint_maps,
+            prompt_feats,
+            prompt_target_maps,
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
             query_feats,
-            query_target_canvas,
+            query_target_map,
             prompt_type,
         )
+        class_detail_tokens = prompt_encoding["class_detail_tokens"]
+        bsz, num_slots, num_tokens, dim = class_detail_tokens.shape
+        pooled_detail = F.adaptive_avg_pool1d(
+            class_detail_tokens.permute(0, 1, 3, 2).reshape(bsz * num_slots, dim, num_tokens),
+            output_size=self.context_cfg.slot_memory_tokens,
+        ).reshape(bsz, num_slots, dim, self.context_cfg.slot_memory_tokens).permute(0, 1, 3, 2)
+        slot_memory = torch.cat([grounding["slot_memory"], pooled_detail], dim=2)
         branches = self.head(
             grounding["fused_feats"],
             fg_prior_pyramid=grounding["fg_prior_pyramid"],
@@ -99,17 +126,17 @@ class PromptDET(nn.Module):
         max_scale = math.exp(self.cfg.max_logit_scale)
         logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         for branch in branches.values():
-            branch["slot_memory"] = grounding["slot_memory"]
+            branch["slot_memory"] = slot_memory
             branch["class_mask"] = grounding["class_mask"]
             branch["logit_scale"] = logit_scale
         branches["context_aux"] = {
             "slot_logits": grounding["slot_logits"],
             "fg_logits": grounding["fg_logits"],
-            "quality_logits": grounding["quality_logits"],
+            "center_logits": grounding["center_logits"],
             "slot_prior_map": grounding["slot_prior_map"],
-            "query_canvas_pred_rgb": grounding["query_canvas_pred_rgb"],
-            "query_canvas_mask": grounding["query_canvas_mask"],
-            "masked_query_canvas_rgb": grounding["masked_query_canvas_rgb"],
+            "query_target_pred": grounding["query_target_pred"],
+            "query_target_mask": grounding["query_target_mask"],
+            "masked_query_target": grounding["masked_query_target"],
         }
         if decode:
             return self.decode_raw(branches)

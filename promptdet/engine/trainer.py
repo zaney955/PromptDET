@@ -35,9 +35,9 @@ def _move_targets(targets, device: torch.device):
             "category_ids": target["category_ids"].to(device),
             "dense_slot_target": target["dense_slot_target"].to(device),
             "dense_fg_target": target["dense_fg_target"].to(device),
+            "dense_center_target": target["dense_center_target"].to(device),
             "dense_valid_mask": target["dense_valid_mask"].to(device),
-            "query_target_canvas": target["query_target_canvas"].to(device),
-            "query_pseudo_masks": target["query_pseudo_masks"].to(device),
+            "query_target_map": target["query_target_map"].to(device),
             "non_target_boxes": target["non_target_boxes"].to(device),
             "non_target_weights": target["non_target_weights"].to(device),
             "image_size": target["image_size"],
@@ -91,6 +91,7 @@ def train(
             "loss_contrast": 0.0,
             "loss_slot": 0.0,
             "loss_fg": 0.0,
+            "loss_center": 0.0,
             "loss_prior_consistency": 0.0,
             "num_pos": 0.0,
             "num_neg": 0.0,
@@ -110,14 +111,13 @@ def train(
             prompt_images = batch["prompt_images"].to(device)
             prompt_boxes = batch["prompt_boxes"].to(device)
             prompt_hint_maps = batch["prompt_hint_maps"].to(device)
-            prompt_pseudo_masks = batch["prompt_pseudo_masks"].to(device)
-            prompt_target_canvases = batch["prompt_target_canvases"].to(device)
+            prompt_target_maps = batch["prompt_target_maps"].to(device)
             prompt_class_indices = batch["prompt_class_indices"].to(device)
             prompt_instance_mask = batch["prompt_instance_mask"].to(device)
             prompt_class_mask = batch["prompt_class_mask"].to(device)
             prompt_type = batch["prompt_type"].to(device)
             query_image = batch["query_image"].to(device)
-            query_target_canvas = batch["query_target_canvas"].to(device)
+            query_target_map = batch["query_target_map"].to(device)
             targets = _move_targets(batch["targets"], device)
 
             optimizer.zero_grad(set_to_none=True)
@@ -131,14 +131,13 @@ def train(
                     prompt_images,
                     prompt_boxes,
                     prompt_hint_maps,
-                    prompt_pseudo_masks,
-                    prompt_target_canvases,
+                    prompt_target_maps,
                     prompt_class_indices,
                     prompt_instance_mask,
                     prompt_class_mask,
                     query_image,
                     prompt_type,
-                    query_target_canvas=query_target_canvas,
+                    query_target_map=query_target_map,
                     decode=True,
                 )
                 losses = loss_fn(decoded, targets)
@@ -163,7 +162,7 @@ def train(
                 nul=f"{float(losses['loss_null'].item()):.4f}",
                 cvs=f"{float(losses['loss_canvas'].item()):.4f}",
                 box=f"{float(losses['loss_box_prior'].item()):.4f}",
-                grd=f"{float(losses['loss_slot'].item() + losses['loss_fg'].item()):.4f}",
+                grd=f"{float(losses['loss_slot'].item() + losses['loss_fg'].item() + losses['loss_center'].item()):.4f}",
                 pos=f"{float(losses['num_pos'].item()):.1f}",
                 ps=f"{float(losses['mean_pos_score'].item()):.3f}",
                 ns=f"{float(losses['mean_neg_score'].item()):.3f}",

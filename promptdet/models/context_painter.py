@@ -42,11 +42,12 @@ class PromptContextPainter(nn.Module):
         self.dim = cfg.dim
         self.feature_ensemble_start = cfg.feature_ensemble_start
         self.query_mask_ratio = float(cfg.query_mask_ratio)
+        self.target_channels = int(cfg.target_channels)
 
         hidden = max(cfg.dim // 2, 32)
         self.image_proj = nn.Conv2d(in_channels, cfg.dim, 1)
         self.target_proj = nn.Sequential(
-            ConvBNAct(3, hidden, 3),
+            ConvBNAct(self.target_channels, hidden, 3),
             ConvBNAct(hidden, cfg.dim, 3),
         )
         self.context_proj = nn.Sequential(
@@ -56,7 +57,7 @@ class PromptContextPainter(nn.Module):
         self.canvas_decoder = nn.Sequential(
             ConvBNAct(cfg.dim, cfg.recon_decoder_dim, 3),
             ConvBNAct(cfg.recon_decoder_dim, cfg.recon_decoder_dim, 3),
-            nn.Conv2d(cfg.recon_decoder_dim, 3, 1),
+            nn.Conv2d(cfg.recon_decoder_dim, self.target_channels, 1),
         )
         self.slot_head = nn.Sequential(
             ConvBNAct(cfg.dim * 2, cfg.dim, 3),
@@ -66,7 +67,7 @@ class PromptContextPainter(nn.Module):
             ConvBNAct(cfg.dim * 2, cfg.dim, 3),
             nn.Conv2d(cfg.dim, 1, 1),
         )
-        self.quality_head = nn.Sequential(
+        self.center_head = nn.Sequential(
             ConvBNAct(cfg.dim * 2, cfg.dim, 3),
             nn.Conv2d(cfg.dim, 1, 1),
         )
@@ -115,10 +116,10 @@ class PromptContextPainter(nn.Module):
     def forward(
         self,
         prompt_feat: torch.Tensor,
-        prompt_target_canvas: torch.Tensor,
+        prompt_target_maps: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         query_feat: torch.Tensor,
-        query_target_canvas: torch.Tensor | None,
+        query_target_maps: torch.Tensor | None,
         prompt_type: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         batch_size, num_instances, channels, height, width = prompt_feat.shape
@@ -126,14 +127,23 @@ class PromptContextPainter(nn.Module):
         device = prompt_feat.device
 
         flat_prompt_feat = prompt_feat.reshape(batch_size * num_instances, channels, height, width)
-        flat_prompt_target = prompt_target_canvas.reshape(batch_size * num_instances, 3, *prompt_target_canvas.shape[-2:])
+        flat_prompt_target = prompt_target_maps.reshape(
+            batch_size * num_instances,
+            self.target_channels,
+            *prompt_target_maps.shape[-2:],
+        )
         flat_prompt_target = F.interpolate(flat_prompt_target, size=(height, width), mode="bilinear", align_corners=False)
 
-        if query_target_canvas is None:
-            query_target_low = query_feat.new_zeros((batch_size, 3, height, width))
+        if query_target_maps is None:
+            query_target_low = query_feat.new_zeros((batch_size, self.target_channels, height, width))
             has_query_target = False
         else:
-            query_target_low = F.interpolate(query_target_canvas, size=(height, width), mode="bilinear", align_corners=False)
+            query_target_low = F.interpolate(
+                query_target_maps,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
             has_query_target = True
 
         query_mask = self._make_query_mask(batch_size, height, width, device=device, has_target=has_query_target)
@@ -206,17 +216,19 @@ class PromptContextPainter(nn.Module):
         prompt_memory_feat = 0.5 * (prompt_img_latent + prompt_tgt_latent)
 
         query_context_feat = self.context_proj(query_latent)
-        query_canvas_pred = self.canvas_decoder(query_tgt_latent)
-        query_canvas_pred = F.interpolate(
-            query_canvas_pred,
+        query_target_pred = self.canvas_decoder(query_tgt_latent)
+        query_target_pred = F.interpolate(
+            query_target_pred,
             size=(self.image_size, self.image_size),
             mode="bilinear",
             align_corners=False,
-        ).sigmoid()
+        )
+        query_target_pred[:, :3] = query_target_pred[:, :3].sigmoid()
+        query_target_pred[:, 3:] = query_target_pred[:, 3:].sigmoid()
 
         dense_slot_logits = self.slot_head(query_latent)
         dense_fg_logits = self.fg_head(query_latent)
-        dense_quality_logits = self.quality_head(query_latent)
+        dense_center_logits = self.center_head(query_latent)
         dense_slot_logits = F.interpolate(
             dense_slot_logits,
             size=(self.image_size, self.image_size),
@@ -229,29 +241,29 @@ class PromptContextPainter(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        dense_quality_logits = F.interpolate(
-            dense_quality_logits,
+        dense_center_logits = F.interpolate(
+            dense_center_logits,
             size=(self.image_size, self.image_size),
             mode="bilinear",
             align_corners=False,
         )
-        masked_query_canvas_rgb = F.interpolate(
+        masked_query_target = F.interpolate(
             masked_query_target,
             size=(self.image_size, self.image_size),
             mode="bilinear",
             align_corners=False,
         )
-        query_canvas_mask = F.interpolate(query_mask, size=(self.image_size, self.image_size), mode="nearest")
+        query_target_mask = F.interpolate(query_mask, size=(self.image_size, self.image_size), mode="nearest")
 
         return {
             "query_context_feat": query_context_feat,
             "prompt_memory_feat": prompt_memory_feat,
-            "query_canvas_pred_rgb": query_canvas_pred,
-            "query_canvas_mask": query_canvas_mask,
-            "masked_query_canvas_rgb": masked_query_canvas_rgb,
+            "query_target_pred": query_target_pred,
+            "query_target_mask": query_target_mask,
+            "masked_query_target": masked_query_target,
             "slot_logits": dense_slot_logits,
             "fg_logits": dense_fg_logits,
-            "quality_logits": dense_quality_logits,
+            "center_logits": dense_center_logits,
         }
 
 

@@ -80,6 +80,32 @@ def build_box_region_weights(
     return weights
 
 
+def build_center_heat_targets(
+    anchor_points: torch.Tensor,
+    boxes: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    targets = anchor_points.new_zeros((anchor_points.shape[0],))
+    if boxes.numel() == 0:
+        return targets
+    sigma = max(float(sigma), 1e-3)
+    for box in boxes:
+        inside = (
+            (anchor_points[:, 0] >= box[0])
+            & (anchor_points[:, 0] <= box[2])
+            & (anchor_points[:, 1] >= box[1])
+            & (anchor_points[:, 1] <= box[3])
+        )
+        if not inside.any():
+            continue
+        gt_center = (box[:2] + box[2:]) * 0.5
+        half_size = ((box[2:] - box[:2]) * 0.5).clamp(min=1.0)
+        center_delta = (anchor_points - gt_center) / (half_size * sigma)
+        heat = torch.exp(-0.5 * center_delta.pow(2).sum(dim=1))
+        targets = torch.maximum(targets, heat * inside.float())
+    return targets.clamp(0.0, 1.0)
+
+
 def max_prompt_logit_margin_loss(logits: torch.Tensor, margin: float) -> torch.Tensor:
     if logits.numel() == 0:
         return logits.new_tensor(0.0)
@@ -405,6 +431,11 @@ class PromptDetectionLoss(torch.nn.Module):
             )
 
             objectness_target = assign.target_scores.max(dim=-1).values
+            center_target = build_center_heat_targets(
+                anchor_points,
+                gt_boxes,
+                sigma=self.cfg.center_target_sigma,
+            )
             total_objectness = total_objectness + sigmoid_varifocal_loss(
                 pred_objectness[batch_idx],
                 objectness_target,
@@ -414,7 +445,7 @@ class PromptDetectionLoss(torch.nn.Module):
             )
             total_targetness = total_targetness + sigmoid_varifocal_loss(
                 pred_targetness[batch_idx],
-                objectness_target,
+                center_target,
                 alpha=self.cfg.focal_alpha,
                 gamma=self.cfg.focal_gamma,
                 reduction="mean",
@@ -586,32 +617,35 @@ class PromptDetectionLoss(torch.nn.Module):
                 "loss_canvas": zero,
                 "loss_slot": zero,
                 "loss_fg": zero,
+                "loss_center": zero,
                 "loss_prior_consistency": zero,
             }
 
         slot_logits = context_aux["slot_logits"]
         fg_logits = context_aux["fg_logits"]
-        quality_logits = context_aux["quality_logits"]
+        center_logits = context_aux["center_logits"]
         slot_prior_map = context_aux["slot_prior_map"]
-        query_canvas_pred_rgb = context_aux["query_canvas_pred_rgb"]
-        query_canvas_mask = context_aux["query_canvas_mask"]
+        query_target_pred = context_aux["query_target_pred"]
+        query_target_mask = context_aux["query_target_mask"]
         total_canvas = slot_logits.new_tensor(0.0)
         total_slot = slot_logits.new_tensor(0.0)
         total_fg = slot_logits.new_tensor(0.0)
+        total_center = slot_logits.new_tensor(0.0)
         total_prior = slot_logits.new_tensor(0.0)
 
         for batch_idx, target in enumerate(targets):
             dense_slot_target = target["dense_slot_target"]
             dense_fg_target = target["dense_fg_target"]
+            dense_center_target = target["dense_center_target"]
             dense_valid_mask = target["dense_valid_mask"]
-            query_target_canvas = target["query_target_canvas"]
+            query_target_map = target["query_target_map"]
 
-            canvas_mask = query_canvas_mask[batch_idx].expand_as(query_canvas_pred_rgb[batch_idx]) * dense_valid_mask.unsqueeze(0).float()
+            canvas_mask = query_target_mask[batch_idx].expand_as(query_target_pred[batch_idx]) * dense_valid_mask.unsqueeze(0).float()
             if canvas_mask.sum() <= 0:
-                canvas_mask = dense_valid_mask.unsqueeze(0).float().expand_as(query_canvas_pred_rgb[batch_idx])
+                canvas_mask = dense_valid_mask.unsqueeze(0).float().expand_as(query_target_pred[batch_idx])
             canvas_loss = F.smooth_l1_loss(
-                query_canvas_pred_rgb[batch_idx],
-                query_target_canvas,
+                query_target_pred[batch_idx],
+                query_target_map,
                 reduction="none",
                 beta=0.02,
             )
@@ -639,7 +673,14 @@ class PromptDetectionLoss(torch.nn.Module):
             dice = 1.0 - (2.0 * intersection + 1.0) / (union + 1.0)
             total_fg = total_fg + self.context_cfg.fg_bce_weight * fg_loss + self.context_cfg.fg_dice_weight * dice
 
-            prior_fg = (1.0 - slot_prior_map[batch_idx, :1]) * torch.sigmoid(quality_logits[batch_idx])
+            center_loss = F.binary_cross_entropy_with_logits(
+                center_logits[batch_idx],
+                dense_center_target.unsqueeze(0),
+                reduction="none",
+            )
+            total_center = total_center + (center_loss * fg_mask).sum() / fg_mask.sum().clamp(min=1.0)
+
+            prior_fg = (1.0 - slot_prior_map[batch_idx, :1]) * torch.sigmoid(fg_logits[batch_idx])
             prior_fg = prior_fg.clamp(min=1e-4, max=1.0 - 1e-4)
             prior_logits = torch.logit(prior_fg.float())
             prior_loss = F.binary_cross_entropy_with_logits(
@@ -654,6 +695,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_canvas": total_canvas / num_batches,
             "loss_slot": total_slot / num_batches,
             "loss_fg": total_fg / num_batches,
+            "loss_center": total_center / num_batches,
             "loss_prior_consistency": total_prior / num_batches,
         }
 
@@ -692,6 +734,7 @@ class PromptDetectionLoss(torch.nn.Module):
             + self.context_cfg.canvas_loss_weight * grounding["loss_canvas"]
             + self.context_cfg.slot_loss_weight * grounding["loss_slot"]
             + grounding["loss_fg"]
+            + self.context_cfg.center_loss_weight * grounding["loss_center"]
             + self.context_cfg.prior_consistency_weight * grounding["loss_prior_consistency"]
         )
 
@@ -710,6 +753,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_contrast": one2one["loss_contrast"],
             "loss_slot": grounding["loss_slot"],
             "loss_fg": grounding["loss_fg"],
+            "loss_center": grounding["loss_center"],
             "loss_prior_consistency": grounding["loss_prior_consistency"],
             "num_pos": one2one["num_pos"],
             "num_neg": one2one["num_neg"],

@@ -43,12 +43,13 @@ class DenseGroundingConfig:
     random_color_min_distance: float = 0.45
     hint_inner_shrink: float = 0.6
     hint_bg_expand: float = 0.12
-    grabcut_iters: int = 2
     prior_threshold: float = 0.15
     slot_loss_weight: float = 1.5
     fg_bce_weight: float = 1.0
     fg_dice_weight: float = 1.0
+    center_loss_weight: float = 1.0
     prior_consistency_weight: float = 0.5
+    target_channels: int = 5
 
 
 ContextPainterConfig = DenseGroundingConfig
@@ -67,6 +68,7 @@ class DataConfig:
     max_prompt_images: int = 4
     negative_ratio: float = 0.35
     hard_negative_ratio: float = 0.35
+    same_instance_ratio: float = 0.1
     episodes_per_epoch: int = 2000
     val_episodes: int = 300
     num_workers: int = 2
@@ -124,6 +126,7 @@ class LossConfig:
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     classification_margin: float = 0.2
+    center_target_sigma: float = 0.35
     one2many_weight: float = 1.0
     one2one_weight: float = 1.5
 

@@ -77,13 +77,13 @@ def save_context_prior_visualizations(
 def save_grounding_visualizations(
     grounding_aux: Dict[str, torch.Tensor],
     output_dir: str | Path,
-    prompt_canvases: torch.Tensor | None = None,
+    prompt_targets: torch.Tensor | None = None,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if prompt_canvases is not None and prompt_canvases.numel() > 0:
-        prompt_tiles = [_rgb_tensor_to_image(canvas) for canvas in prompt_canvases]
+    if prompt_targets is not None and prompt_targets.numel() > 0:
+        prompt_tiles = [_rgb_tensor_to_image(target[:3]) for target in prompt_targets]
         width = sum(tile.width for tile in prompt_tiles)
         height = max(tile.height for tile in prompt_tiles)
         tiled = Image.new("RGB", (width, height))
@@ -118,7 +118,15 @@ def save_grounding_visualizations(
     Image.fromarray(slot_rgb, mode="RGB").save(output_dir / "grounding_slot.png")
     Image.fromarray(slot_rgb, mode="RGB").save(output_dir / "dense_slot_argmax.png")
 
-    if "query_canvas_pred_rgb" in grounding_aux:
-        _rgb_tensor_to_image(grounding_aux["query_canvas_pred_rgb"][0]).save(output_dir / "query_canvas_recon.png")
-    if "masked_query_canvas_rgb" in grounding_aux:
-        _rgb_tensor_to_image(grounding_aux["masked_query_canvas_rgb"][0]).save(output_dir / "masked_query_canvas.png")
+    if "query_target_pred" in grounding_aux:
+        _rgb_tensor_to_image(grounding_aux["query_target_pred"][0, :3]).save(output_dir / "query_canvas_recon.png")
+        Image.fromarray(
+            grounding_aux["query_target_pred"][0, 3].detach().cpu().clamp(0.0, 1.0).mul(255).byte().numpy(),
+            mode="L",
+        ).save(output_dir / "query_fg_recon.png")
+        Image.fromarray(
+            grounding_aux["query_target_pred"][0, 4].detach().cpu().clamp(0.0, 1.0).mul(255).byte().numpy(),
+            mode="L",
+        ).save(output_dir / "query_center_recon.png")
+    if "masked_query_target" in grounding_aux:
+        _rgb_tensor_to_image(grounding_aux["masked_query_target"][0, :3]).save(output_dir / "masked_query_canvas.png")

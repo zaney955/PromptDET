@@ -10,8 +10,7 @@ import torch
 from promptdet.config import load_config
 from promptdet.data.prompt_hints import (
     build_prompt_hint_map,
-    build_prompt_target_canvas,
-    generate_grabcut_pseudo_mask,
+    build_prompt_target_map,
     sample_slot_colors,
 )
 from promptdet.models.promptdet import PromptDET
@@ -81,8 +80,8 @@ def _load_prompt_set(
     prompt_types: list[str],
     hint_inner_shrink: float,
     hint_bg_expand: float,
-    grabcut_iters: int,
     random_color_min_distance: float,
+    center_target_sigma: float,
 ):
     if args.prompt_spec:
         prompt_spec_path = Path(args.prompt_spec).resolve()
@@ -102,7 +101,7 @@ def _load_prompt_set(
     prompt_images = []
     prompt_boxes = []
     prompt_hint_maps = []
-    prompt_pseudo_masks = []
+    prompt_target_maps = []
     prompt_class_indices = []
     label_to_slot = {}
 
@@ -137,16 +136,6 @@ def _load_prompt_set(
                 bg_expand=hint_bg_expand,
             )
             prompt_hint_maps.append(hint)
-            pseudo_mask = generate_grabcut_pseudo_mask(
-                resized,
-                bbox,
-                inner_shrink=hint_inner_shrink,
-                bg_expand=hint_bg_expand,
-                iterations=grabcut_iters,
-            )
-            if pseudo_mask is None:
-                pseudo_mask = hint[0]
-            prompt_pseudo_masks.append(pseudo_mask.float())
             prompt_class_indices.append(slot)
 
     if not prompt_images:
@@ -160,17 +149,22 @@ def _load_prompt_set(
     for label, slot in label_to_slot.items():
         prompt_class_ids[slot] = label
     slot_colors = sample_slot_colors(len(label_to_slot), min_distance=random_color_min_distance)
-    prompt_target_canvases = [
-        build_prompt_target_canvas(mask, int(class_idx), slot_colors)
-        for mask, class_idx in zip(prompt_pseudo_masks, prompt_class_indices)
+    prompt_target_maps = [
+        build_prompt_target_map(
+            image_size,
+            box,
+            int(class_idx),
+            slot_colors,
+            center_sigma=center_target_sigma,
+        )
+        for box, class_idx in zip(prompt_boxes, prompt_class_indices)
     ]
 
     return {
         "prompt_images": torch.stack(prompt_images, dim=0).unsqueeze(0),
         "prompt_boxes": torch.stack(prompt_boxes, dim=0).unsqueeze(0),
         "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0).unsqueeze(0),
-        "prompt_pseudo_masks": torch.stack(prompt_pseudo_masks, dim=0).unsqueeze(0),
-        "prompt_target_canvases": torch.stack(prompt_target_canvases, dim=0).unsqueeze(0),
+        "prompt_target_maps": torch.stack(prompt_target_maps, dim=0).unsqueeze(0),
         "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long).unsqueeze(0),
         "prompt_instance_mask": torch.ones((1, len(prompt_images)), dtype=torch.bool),
         "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long).unsqueeze(0),
@@ -202,8 +196,7 @@ def _run_single_query(
             prompt_batch["prompt_images"].to(device),
             prompt_batch["prompt_boxes"].to(device),
             prompt_batch["prompt_hint_maps"].to(device),
-            prompt_batch["prompt_pseudo_masks"].to(device),
-            prompt_batch["prompt_target_canvases"].to(device),
+            prompt_batch["prompt_target_maps"].to(device),
             prompt_batch["prompt_class_indices"].to(device),
             prompt_batch["prompt_instance_mask"].to(device),
             prompt_batch["prompt_class_mask"].to(device),
@@ -267,8 +260,8 @@ def main():
         config.model.prompt_types,
         config.dense_grounding.hint_inner_shrink,
         config.dense_grounding.hint_bg_expand,
-        config.dense_grounding.grabcut_iters,
         config.dense_grounding.random_color_min_distance,
+        config.loss.center_target_sigma,
     )
     query_path = Path(args.query_image).resolve()
     query_images = _iter_query_images(query_path)
@@ -309,7 +302,7 @@ def main():
             save_grounding_visualizations(
                 grounding_aux,
                 current_output_dir,
-                prompt_canvases=prompt_batch["prompt_target_canvases"][0],
+                prompt_targets=prompt_batch["prompt_target_maps"][0],
             )
             (current_output_dir / "grounding_debug.json").write_text(
                 json.dumps(

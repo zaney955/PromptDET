@@ -32,8 +32,7 @@ def evaluate(
         prompt_images = batch["prompt_images"].to(device)
         prompt_boxes = batch["prompt_boxes"].to(device)
         prompt_hint_maps = batch["prompt_hint_maps"].to(device)
-        prompt_pseudo_masks = batch["prompt_pseudo_masks"].to(device)
-        prompt_target_canvases = batch["prompt_target_canvases"].to(device)
+        prompt_target_maps = batch["prompt_target_maps"].to(device)
         prompt_class_indices = batch["prompt_class_indices"].to(device)
         prompt_instance_mask = batch["prompt_instance_mask"].to(device)
         prompt_class_ids = batch["prompt_class_ids"].to(device)
@@ -45,8 +44,7 @@ def evaluate(
             prompt_images,
             prompt_boxes,
             prompt_hint_maps,
-            prompt_pseudo_masks,
-            prompt_target_canvases,
+            prompt_target_maps,
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,

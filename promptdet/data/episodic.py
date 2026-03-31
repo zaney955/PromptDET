@@ -11,11 +11,9 @@ import torch
 from torch.utils.data import Dataset
 
 from promptdet.data.prompt_hints import (
-    build_canvas_from_slot_target,
-    build_prompt_target_canvas,
     build_prompt_hint_map,
-    build_query_dense_targets,
-    generate_grabcut_pseudo_mask,
+    build_prompt_target_map,
+    build_query_detection_targets,
     sample_slot_colors,
 )
 from promptdet.data.yolo_io import load_class_names, load_image_list, parse_yolo_label_file
@@ -61,10 +59,10 @@ class PromptEpisodeDataset(Dataset):
         max_prompt_images: int = 4,
         confusable_non_target_weight: float = 2.0,
         color_min_distance: float = 0.45,
-        soft_box_sigma: float = 0.35,
+        same_instance_ratio: float = 0.1,
+        center_target_sigma: float = 0.35,
         hint_inner_shrink: float = 0.6,
         hint_bg_expand: float = 0.12,
-        grabcut_iters: int = 2,
     ):
         super().__init__()
         self.labels_dir = Path(labels_dir)
@@ -79,11 +77,10 @@ class PromptEpisodeDataset(Dataset):
         self.max_prompt_images = max_prompt_images
         self.confusable_non_target_weight = confusable_non_target_weight
         self.color_min_distance = color_min_distance
-        self.soft_box_sigma = soft_box_sigma
+        self.same_instance_ratio = same_instance_ratio
+        self.center_target_sigma = center_target_sigma
         self.hint_inner_shrink = hint_inner_shrink
         self.hint_bg_expand = hint_bg_expand
-        self.grabcut_iters = grabcut_iters
-        self.color_min_distance = color_min_distance
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -150,7 +147,7 @@ class PromptEpisodeDataset(Dataset):
             return 0
         if self.prompt_type == "same_instance":
             return 1
-        return random.randint(0, 1)
+        return 1 if random.random() < self.same_instance_ratio else 0
 
     def _sample_prompt_classes(self, prompt_type_id: int) -> List[int]:
         if prompt_type_id == 1:
@@ -211,47 +208,72 @@ class PromptEpisodeDataset(Dataset):
                 confusable.update(self.family_to_classes.get(related_family, set()) - prompt_class_set)
         return confusable
 
-    def _sample_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> Tuple[int, bool]:
+    def _score_positive_query(self, image_id: int, prompt_class_set: set[int]) -> tuple[int, int, int, int]:
+        anns = self.image_to_anns[image_id]
+        cover = len(self.image_to_class_ids[image_id] & prompt_class_set)
+        target_instances = sum(1 for ann in anns if ann["category_id"] in prompt_class_set)
+        unrelated = sum(1 for ann in anns if ann["category_id"] not in prompt_class_set)
+        confusable = sum(1 for ann in anns if ann["category_id"] in self._get_confusable_classes(list(prompt_class_set)))
+        return cover, target_instances, -unrelated, -confusable
+
+    def _select_positive_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int], allow_same_image: bool) -> int | None:
+        prompt_class_set = set(prompt_class_ids)
+        prompt_image_set = set(prompt_image_ids)
+        candidates = sorted(set().union(*(self.class_to_image_ids[class_id] for class_id in prompt_class_ids)))
+        if not allow_same_image:
+            candidates = [image_id for image_id in candidates if image_id not in prompt_image_set]
+        if not candidates:
+            return None
+        ranked = sorted(candidates, key=lambda image_id: self._score_positive_query(image_id, prompt_class_set), reverse=True)
+        shortlist = ranked[: min(len(ranked), 3)]
+        return random.choice(shortlist)
+
+    def _select_negative_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> int | None:
         prompt_class_set = set(prompt_class_ids)
         prompt_image_set = set(prompt_image_ids)
         confusable_class_set = self._get_confusable_classes(prompt_class_ids)
-        positive_ids = sorted(set().union(*(self.class_to_image_ids[class_id] for class_id in prompt_class_ids)))
-        positive_ids = [image_id for image_id in positive_ids if image_id not in prompt_image_set] or positive_ids
-        confusable_positive_ids = [
-            image_id
-            for image_id in positive_ids
-            if self.image_to_class_ids[image_id] & confusable_class_set
-        ]
         negative_ids = [
             image_id
             for image_id in self.image_ids
             if not (self.image_to_class_ids[image_id] & prompt_class_set) and image_id not in prompt_image_set
         ]
+        if not negative_ids:
+            return None
         confusable_negative_ids = [
             image_id
             for image_id in negative_ids
             if self.image_to_class_ids[image_id] & confusable_class_set
         ]
         hard_negative_ids = [image_id for image_id in negative_ids if len(self.image_to_class_ids[image_id]) > 0]
-
         sample = random.random()
         if sample < self.hard_negative_ratio:
-            if confusable_negative_ids:
-                return random.choice(confusable_negative_ids), False
-            if hard_negative_ids:
-                return random.choice(hard_negative_ids), False
-        if sample < self.hard_negative_ratio + self.negative_ratio and negative_ids:
-            return random.choice(negative_ids), False
-        if positive_ids:
-            if confusable_positive_ids and random.random() < 0.5:
-                return random.choice(confusable_positive_ids), True
-            return random.choice(positive_ids), True
-        if confusable_negative_ids:
-            return random.choice(confusable_negative_ids), False
-        if hard_negative_ids:
-            return random.choice(hard_negative_ids), False
-        if negative_ids:
-            return random.choice(negative_ids), False
+            pool = confusable_negative_ids or hard_negative_ids or negative_ids
+        elif sample < self.hard_negative_ratio + self.negative_ratio:
+            pool = hard_negative_ids or negative_ids
+        else:
+            return None
+        pool = sorted(pool, key=lambda image_id: len(self.image_to_anns[image_id]), reverse=True)
+        return random.choice(pool[: min(len(pool), 3)])
+
+    def _sample_query(self, prompt_type_id: int, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> Tuple[int, bool]:
+        positive_id = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=False)
+        negative_id = self._select_negative_query(prompt_class_ids, prompt_image_ids)
+
+        if prompt_type_id == 1:
+            if positive_id is not None:
+                return positive_id, True
+            fallback_positive = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=True)
+            if fallback_positive is not None:
+                return fallback_positive, True
+
+        if negative_id is not None:
+            return negative_id, False
+        if positive_id is not None:
+            return positive_id, True
+
+        fallback_positive = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=True)
+        if fallback_positive is not None:
+            return fallback_positive, True
         return random.choice(self.image_ids), False
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
@@ -264,19 +286,14 @@ class PromptEpisodeDataset(Dataset):
             prompt_class_ids[slot] = class_id
 
         prompt_instances = self._sample_prompt_instances(sampled_prompt_class_ids, class_to_slot)
-        if prompt_type_id == 1:
-            prompt_instances = prompt_instances[:1]
-            query_image_id = prompt_instances[0]["image_id"]
-            positive = True
-        else:
-            prompt_image_ids = [instance["image_id"] for instance in prompt_instances]
-            query_image_id, positive = self._sample_query(sampled_prompt_class_ids, prompt_image_ids)
+        prompt_image_ids = [instance["image_id"] for instance in prompt_instances]
+        query_image_id, positive = self._sample_query(prompt_type_id, sampled_prompt_class_ids, prompt_image_ids)
 
+        slot_colors = sample_slot_colors(len(sampled_prompt_class_ids), min_distance=self.color_min_distance)
         prompt_images = []
         prompt_boxes = []
         prompt_hint_maps = []
-        prompt_pseudo_masks = []
-        prompt_target_canvases = []
+        prompt_target_maps = []
         prompt_class_indices = []
         for instance in prompt_instances:
             image = self._load_image(instance["image_id"])
@@ -288,19 +305,18 @@ class PromptEpisodeDataset(Dataset):
                 inner_shrink=self.hint_inner_shrink,
                 bg_expand=self.hint_bg_expand,
             )
-            pseudo_mask = generate_grabcut_pseudo_mask(
-                image_tensor,
-                box[0],
-                inner_shrink=self.hint_inner_shrink,
-                bg_expand=self.hint_bg_expand,
-                iterations=self.grabcut_iters,
-            )
-            if pseudo_mask is None:
-                pseudo_mask = hint[0]
             prompt_images.append(image_tensor)
             prompt_boxes.append(box[0])
             prompt_hint_maps.append(hint)
-            prompt_pseudo_masks.append(pseudo_mask.float())
+            prompt_target_maps.append(
+                build_prompt_target_map(
+                    self.image_size,
+                    box[0],
+                    int(instance["class_slot"]),
+                    slot_colors,
+                    center_sigma=self.center_target_sigma,
+                )
+            )
             prompt_class_indices.append(instance["class_slot"])
 
         query_image = self._load_image(query_image_id)
@@ -341,26 +357,19 @@ class PromptEpisodeDataset(Dataset):
 
         query_image_tensor, query_boxes_tensor = resize_image_and_boxes(query_image, query_boxes_tensor, self.image_size)
         _, non_target_boxes_tensor = resize_image_and_boxes(query_image, non_target_boxes_tensor, self.image_size)
-        query_dense_slot_target, query_dense_fg_target, query_dense_valid_mask, query_pseudo_masks = build_query_dense_targets(
-            query_image_tensor,
+        query_dense_slot_target, query_dense_fg_target, query_dense_center_target, query_dense_valid_mask, query_target_map = build_query_detection_targets(
+            self.image_size,
             query_boxes_tensor,
             query_labels_tensor,
-            num_slots=len(sampled_prompt_class_ids),
-            inner_shrink=self.hint_inner_shrink,
-            bg_expand=self.hint_bg_expand,
-            grabcut_iters=self.grabcut_iters,
+            slot_colors,
+            center_sigma=self.center_target_sigma,
         )
-        slot_colors = sample_slot_colors(len(sampled_prompt_class_ids), min_distance=self.color_min_distance)
-        for pseudo_mask, class_slot in zip(prompt_pseudo_masks, prompt_class_indices):
-            prompt_target_canvases.append(build_prompt_target_canvas(pseudo_mask, class_slot, slot_colors))
-        query_target_canvas = build_canvas_from_slot_target(query_dense_slot_target, slot_colors)
 
         return {
             "prompt_images": torch.stack(prompt_images, dim=0),
             "prompt_boxes": torch.stack(prompt_boxes, dim=0),
             "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0),
-            "prompt_pseudo_masks": torch.stack(prompt_pseudo_masks, dim=0),
-            "prompt_target_canvases": torch.stack(prompt_target_canvases, dim=0),
+            "prompt_target_maps": torch.stack(prompt_target_maps, dim=0),
             "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long),
             "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long),
             "slot_colors": slot_colors,
@@ -371,9 +380,9 @@ class PromptEpisodeDataset(Dataset):
             "query_category_ids": query_category_ids_tensor,
             "query_dense_slot_target": query_dense_slot_target,
             "query_dense_fg_target": query_dense_fg_target,
+            "query_dense_center_target": query_dense_center_target,
             "query_dense_valid_mask": query_dense_valid_mask,
-            "query_target_canvas": query_target_canvas,
-            "query_pseudo_masks": query_pseudo_masks,
+            "query_target_map": query_target_map,
             "query_non_target_boxes": non_target_boxes_tensor,
             "query_non_target_weights": non_target_weights_tensor,
             "image_size": torch.tensor(self.image_size, dtype=torch.long),
@@ -386,12 +395,12 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
     max_prompt_instances = max(item["prompt_images"].shape[0] for item in batch)
     max_prompt_classes = max(item["prompt_class_ids"].shape[0] for item in batch)
     channels, height, width = batch[0]["query_image"].shape
+    target_channels = batch[0]["prompt_target_maps"].shape[1]
 
     prompt_images = torch.zeros((batch_size, max_prompt_instances, channels, height, width), dtype=torch.float32)
     prompt_boxes = torch.zeros((batch_size, max_prompt_instances, 4), dtype=torch.float32)
     prompt_hint_maps = torch.zeros((batch_size, max_prompt_instances, 3, height, width), dtype=torch.float32)
-    prompt_pseudo_masks = torch.zeros((batch_size, max_prompt_instances, height, width), dtype=torch.float32)
-    prompt_target_canvases = torch.zeros((batch_size, max_prompt_instances, 3, height, width), dtype=torch.float32)
+    prompt_target_maps = torch.zeros((batch_size, max_prompt_instances, target_channels, height, width), dtype=torch.float32)
     prompt_class_indices = torch.zeros((batch_size, max_prompt_instances), dtype=torch.long)
     prompt_instance_mask = torch.zeros((batch_size, max_prompt_instances), dtype=torch.bool)
     prompt_class_ids = torch.full((batch_size, max_prompt_classes), -1, dtype=torch.long)
@@ -404,8 +413,7 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         prompt_images[batch_idx, :num_instances] = item["prompt_images"]
         prompt_boxes[batch_idx, :num_instances] = item["prompt_boxes"]
         prompt_hint_maps[batch_idx, :num_instances] = item["prompt_hint_maps"]
-        prompt_pseudo_masks[batch_idx, :num_instances] = item["prompt_pseudo_masks"]
-        prompt_target_canvases[batch_idx, :num_instances] = item["prompt_target_canvases"]
+        prompt_target_maps[batch_idx, :num_instances] = item["prompt_target_maps"]
         prompt_class_indices[batch_idx, :num_instances] = item["prompt_class_indices"]
         prompt_instance_mask[batch_idx, :num_instances] = True
         prompt_class_ids[batch_idx, :num_classes] = item["prompt_class_ids"]
@@ -416,8 +424,7 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "prompt_images": prompt_images,
         "prompt_boxes": prompt_boxes,
         "prompt_hint_maps": prompt_hint_maps,
-        "prompt_pseudo_masks": prompt_pseudo_masks,
-        "prompt_target_canvases": prompt_target_canvases,
+        "prompt_target_maps": prompt_target_maps,
         "prompt_class_indices": prompt_class_indices,
         "prompt_instance_mask": prompt_instance_mask,
         "prompt_class_ids": prompt_class_ids,
@@ -425,7 +432,7 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "slot_colors": slot_colors,
         "prompt_type": torch.stack([item["prompt_type"] for item in batch], dim=0),
         "query_image": torch.stack([item["query_image"] for item in batch], dim=0),
-        "query_target_canvas": torch.stack([item["query_target_canvas"] for item in batch], dim=0),
+        "query_target_map": torch.stack([item["query_target_map"] for item in batch], dim=0),
         "targets": [
             {
                 "boxes": item["query_boxes"],
@@ -433,9 +440,9 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
                 "category_ids": item["query_category_ids"],
                 "dense_slot_target": item["query_dense_slot_target"],
                 "dense_fg_target": item["query_dense_fg_target"],
+                "dense_center_target": item["query_dense_center_target"],
                 "dense_valid_mask": item["query_dense_valid_mask"],
-                "query_target_canvas": item["query_target_canvas"],
-                "query_pseudo_masks": item["query_pseudo_masks"],
+                "query_target_map": item["query_target_map"],
                 "non_target_boxes": item["query_non_target_boxes"],
                 "non_target_weights": item["query_non_target_weights"],
                 "image_size": int(item["image_size"].item()),

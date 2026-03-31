@@ -11,14 +11,13 @@ Prompt labels are episode-local identity tokens used to group prompt instances i
 
 The implementation combines:
 
-- SegGPT-style dense in-context grounding with box-derived prompt targets
-- YOLO-style multi-scale dense detection
-- DFL-based box regression
+- SegGPT-style dense in-context grounding with box-derived prompt geometry maps
+- dense-map-first multi-scale detection
 - dual detection heads:
   - `one2many` for dense auxiliary supervision during training
   - `one2one` for unique-matching final inference
-- prompt slot memory for classification instead of fixed closed-set heads
-- dense canvas reconstruction, slot priors, and NMS-free `one2one` inference with local peak filtering and oversize-box suppression
+- prompt-conditioned dense slot priors instead of fixed closed-set heads
+- dense canvas reconstruction, center-aware decoding, and NMS-free `one2one` inference with local peak filtering and oversize-box suppression
 
 ## Project Layout
 
@@ -92,6 +91,7 @@ python train.py \
 ```
 
 The `batch_size` argument is the per-process batch size. For example, `torchrun --nproc_per_node=4 ... --batch-size 8` gives an effective global batch size of `32`.
+For the current toy setup with per-process `batch_size=1`, the default config uses `GroupNorm`; you can switch `mixed_precision` on or off from `configs/toy_train.json` depending on device stability.
 
 Sampling behavior is controlled in `configs/toy_train.json`:
 
@@ -99,15 +99,24 @@ Sampling behavior is controlled in `configs/toy_train.json`:
 - `data.max_prompt_instances_per_class`
 - `data.max_prompt_images`
 - `data.negative_ratio`
-- `data.hard_negative_ratio`
+- `data.same_instance_ratio`
 
 Dense grounding behavior is controlled in `configs/toy_train.json` under `dense_grounding`:
 
-- `dense_grounding.slot_memory_tokens`
 - `dense_grounding.query_mask_ratio`
 - `dense_grounding.canvas_loss_weight`
 - `dense_grounding.feature_ensemble_start`
 - `dense_grounding.random_color_min_distance`
+- `dense_grounding.target_channels`
+- `dense_grounding.center_loss_weight`
+
+Detection-target behavior is controlled in `configs/toy_train.json` under `loss`:
+
+- `loss.center_target_sigma`
+- `loss.one2one_center_sampling_radius`
+- `loss.one2one_duplicate_radius`
+- `loss.classification_margin`
+- `loss.non_target_logit_margin`
 
 ## Inference
 
@@ -189,6 +198,8 @@ Outputs:
 - `dense_slot_argmax.png`
 - `prompt_canvas.png`
 - `query_canvas_recon.png`
+- `query_fg_recon.png`
+- `query_center_recon.png`
 
 ## Detection Behavior
 
@@ -196,13 +207,13 @@ Inference uses the `one2one` branch only.
 The intended prediction path is:
 
 - decode `one2one`
-- apply local peak filtering
-- combine objectness, prompt-conditioned targetness, prompt-class confidence, and null competition into a quality-aware score
+- apply local peak filtering on center logits
+- combine center-aware objectness, prompt-class confidence, and quality confidence into a score
 - apply size-aware suppression to near-full-image false boxes before thresholding
 - threshold
 - top-k
 
-The main inference path is NMS-free by design. `nms_iou_threshold` may still exist in configs or CLI for compatibility, but NMS is not part of the intended final prediction behavior.
+The main inference path is NMS-free by design.
 
 ## Current Scope
 
@@ -210,19 +221,19 @@ Implemented:
 
 - full modular prompt-conditioned detector with prompt-set episodes
 - shared backbone and PAN/FPN neck
-- bbox-first prompt hint maps with trimap-style seeds
-- box-derived prompt pseudo masks and random slot-colored prompt/query target canvases
+- explicit box-conditioned prompt encoder plus multi-scale prompt-query fusion
+- bbox-first prompt hint maps and box-aware prompt/query target maps
 - SegGPT-style dense prompt/query context painter with feature-ensemble query aggregation
 - dense slot / foreground grounding priors driving the detection head
-- prompt slot memory aggregation from full-image masked prompt features
+- prompt slot memory aggregation from box-aware prompt features
 - dual-branch dense detection head with DFL regression
-- prompt-conditioned targetness prediction
+- prompt-conditioned center-quality prediction
 - explicit null competition against prompt classes during scoring
 - grounding-aware positive assignment
 - dynamic prompt-class assignment
 - `one2one` unique matching with duplicate suppression supervision
 - local peak filtering for NMS-free `one2one` inference
-- bbox-derived dense supervision with GrabCut pseudo-mask fallback
+- box-aware dense supervision for slot / foreground / center targets
 - training and validation loops
 - single-node distributed training with DDP
 - standalone inference script

@@ -92,10 +92,10 @@ def main():
         max_prompt_images=config.data.max_prompt_images,
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
         color_min_distance=config.dense_grounding.random_color_min_distance,
-        soft_box_sigma=0.35,
+        same_instance_ratio=config.data.same_instance_ratio,
+        center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
-        grabcut_iters=config.dense_grounding.grabcut_iters,
     )
     val_dataset = PromptEpisodeDataset(
         image_list_path=config.data.val_list,
@@ -111,10 +111,10 @@ def main():
         max_prompt_images=config.data.max_prompt_images,
         confusable_non_target_weight=config.loss.confusable_non_target_weight,
         color_min_distance=config.dense_grounding.random_color_min_distance,
-        soft_box_sigma=0.35,
+        same_instance_ratio=config.data.same_instance_ratio,
+        center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
-        grabcut_iters=config.dense_grounding.grabcut_iters,
     )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist_info["distributed"] else None

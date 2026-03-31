@@ -27,12 +27,18 @@
   - as same-class or mixed-class prompt sets
 
 ## Sampling and Training Constraints
-- Hard negatives should preferentially include confusable non-target objects, especially same-family shapes/colors.
 - Sampling should continue to expose:
   - positive episodes
   - negative episodes
-  - hard negative episodes
   - mixed prompt-class episodes
+- Positive and negative training episodes should stay approximately balanced by design, rather than relying on uncontrolled random draws.
+- In `mixed` prompt mode, sampling should preserve that balance explicitly even when some prompt types can only generate positive episodes.
+- Positive query images should be chosen deliberately from images that contain prompt-defined categories in the label files.
+- When multiple positive query candidates exist, prefer images that:
+  - cover more of the prompt-defined classes
+  - contain more instances of those prompt-defined classes
+  - avoid excessive unrelated objects when possible
+- Negative query images should be chosen from labeled images that contain no prompt-defined classes, not from unlabeled or semantically unknown images.
 - If adding new losses or assigners, preserve the distinction:
   - `one2many` improves optimization
   - `one2one` determines final prediction behavior
@@ -57,7 +63,7 @@
   - threshold
   - top-k
 - Avoid category-wise suppression as a substitute for correct one-to-one learning.
-- `nms_iou_threshold` may exist for compatibility, but NMS is not part of the intended final architecture.
+- NMS is not part of the intended final architecture.
 
 ## Data and Toy Dataset
 - `toy_data` labels must stay consistent with the generated `train.txt`, `val.txt`, `classes.txt`, and `prompt_set.json`.
