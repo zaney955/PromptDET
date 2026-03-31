@@ -98,8 +98,7 @@ Sampling behavior is controlled in `configs/toy_train.json`:
 - `data.min_prompt_classes` / `data.max_prompt_classes`
 - `data.max_prompt_instances_per_class`
 - `data.max_prompt_images`
-- `data.negative_ratio`
-- `data.same_instance_ratio`
+- `data.negative_episode_ratio`
 
 Dense grounding behavior is controlled in `configs/toy_train.json` under `dense_grounding`:
 

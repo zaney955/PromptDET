@@ -17,11 +17,25 @@ class PromptQueryFusionBlock(nn.Module):
         self.attn = nn.MultiheadAttention(channels, num_heads=num_heads, batch_first=True)
         self.ffn = MLP(channels, hidden_dim=channels * 4, out_dim=channels)
         self.query_to_prompt = nn.Linear(channels, prompt_dim)
-        self.film = nn.Linear(prompt_dim, channels * 2)
+        self.class_film = nn.Linear(prompt_dim, channels * 2)
         self.sim_proj = nn.Conv2d(channels, channels, 1)
         self.null_prompt = nn.Parameter(torch.randn(1, prompt_dim))
         self.null_scale_token = nn.Parameter(torch.randn(1, channels))
-        self.refine = ConvBNAct(channels + 4, channels, 3)
+        self.refine = ConvBNAct(channels + 6, channels, 3)
+
+    @staticmethod
+    def _aggregate_instance_scores(
+        instance_scores: torch.Tensor,
+        instance_mask: torch.Tensor,
+        instance_class_indices: torch.Tensor,
+        num_classes: int,
+    ) -> torch.Tensor:
+        safe_indices = instance_class_indices.clamp(min=0, max=num_classes - 1)
+        class_assign = F.one_hot(safe_indices, num_classes=num_classes).float()
+        class_assign = class_assign * instance_mask.unsqueeze(-1).float()
+        class_counts = class_assign.sum(dim=1).clamp(min=1.0)
+        class_scores = torch.einsum("bni,bik->bnk", instance_scores, class_assign)
+        return class_scores / class_counts.unsqueeze(1)
 
     def forward(
         self,
@@ -31,6 +45,10 @@ class PromptQueryFusionBlock(nn.Module):
         class_prototypes: torch.Tensor,
         class_mask: torch.Tensor,
         scale_tokens: torch.Tensor,
+        instance_prototypes: torch.Tensor,
+        instance_class_indices: torch.Tensor,
+        instance_mask: torch.Tensor,
+        instance_scale_tokens: torch.Tensor,
     ) -> torch.Tensor:
         b, c, h, w = x.shape
         query = x.flatten(2).transpose(1, 2)
@@ -44,45 +62,80 @@ class PromptQueryFusionBlock(nn.Module):
         query_prompt = F.normalize(self.query_to_prompt(query), dim=-1)
         prompt_proto = F.normalize(class_prototypes, dim=-1)
         null_prompt = F.normalize(self.null_prompt, dim=-1).expand(b, -1, -1)
-        all_prompt_proto = torch.cat([null_prompt, prompt_proto], dim=1)
-        all_prompt_logits = torch.einsum("bnd,bkd->bnk", query_prompt, all_prompt_proto)
-        class_logits = all_prompt_logits[:, :, 1:]
-        class_logits = class_logits.masked_fill(~class_mask.unsqueeze(1), -1e4)
-        class_weights = torch.softmax(all_prompt_logits, dim=-1)
-        prompt_weights = class_weights[:, :, 1:]
-        adaptive_prompt = torch.einsum("bnk,bkd->bnd", prompt_weights, class_prototypes)
-        prompt_presence = 1.0 - class_weights[:, :, :1]
-        best_prompt_logit = class_logits.max(dim=-1, keepdim=True).values
-        prompt_vs_null = best_prompt_logit - all_prompt_logits[:, :, :1]
+        class_logits = torch.einsum("bnd,bkd->bnk", query_prompt, prompt_proto)
+        null_prompt_logits = torch.einsum("bnd,bkd->bnk", query_prompt, null_prompt)
+        class_vs_null = class_logits - null_prompt_logits
+        class_vs_null = class_vs_null.masked_fill(~class_mask.unsqueeze(1), -1e4)
+        class_presence = class_vs_null.sigmoid() * class_mask.unsqueeze(1).float()
 
-        gamma, beta = self.film(adaptive_prompt).chunk(2, dim=-1)
-        query = query * (1 + gamma) + beta
+        instance_prototypes = F.normalize(instance_prototypes, dim=-1)
+        instance_logits = torch.einsum("bnd,bid->bni", query_prompt, instance_prototypes)
+        instance_logits = instance_logits.masked_fill(~instance_mask.unsqueeze(1), -1e4)
+        instance_presence = (instance_logits - null_prompt_logits).sigmoid() * instance_mask.unsqueeze(1).float()
+        class_instance_presence = self._aggregate_instance_scores(
+            instance_presence,
+            instance_mask,
+            instance_class_indices,
+            class_prototypes.shape[1],
+        )
+        class_instance_presence = class_instance_presence * class_mask.unsqueeze(1).float()
+
+        # Class branches remain independent. Instance-level evidence only reinforces
+        # the matching branch of its own class before late aggregation.
+        combined_class_presence = 0.5 * (class_presence + class_instance_presence)
+        class_weight_sum = combined_class_presence.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        normalized_class_weights = combined_class_presence / class_weight_sum
+
+        class_gamma, class_beta = self.class_film(class_prototypes).chunk(2, dim=-1)
+        branch_delta = (
+            query.unsqueeze(2) * class_gamma.unsqueeze(1)
+            + class_beta.unsqueeze(1)
+        ) * normalized_class_weights.unsqueeze(-1)
+        query = query + branch_delta.sum(dim=2)
         x = query.transpose(1, 2).reshape(b, c, h, w)
 
         sim_feat = self.sim_proj(x)
         feat_tokens = F.normalize(sim_feat.flatten(2).transpose(1, 2), dim=-1)
         scale_tokens = F.normalize(scale_tokens, dim=-1)
         null_scale_token = F.normalize(self.null_scale_token, dim=-1).expand(b, -1, -1)
-        all_scale_tokens = torch.cat([null_scale_token, scale_tokens], dim=1)
-        sim_logits = torch.einsum("bnd,bkd->bnk", feat_tokens, all_scale_tokens)
-        null_sim = sim_logits[:, :, :1]
-        sim_logits = sim_logits[:, :, 1:]
-        sim_logits = sim_logits.masked_fill(~class_mask.unsqueeze(1), -1e4)
-        max_sim = sim_logits.max(dim=-1).values
-        if scale_tokens.shape[1] > 1:
-            top2 = torch.topk(sim_logits, k=2, dim=-1).values
-            margin = top2[..., 0] - top2[..., 1]
-            multi_class = (class_mask.sum(dim=1, keepdim=True) > 1).expand(-1, max_sim.shape[1])
-            margin = torch.where(multi_class, margin, torch.ones_like(margin))
-        else:
-            margin = torch.ones_like(max_sim)
-        sim_vs_null = (max_sim.unsqueeze(-1) - null_sim).squeeze(-1)
-        max_sim = max_sim.reshape(b, 1, h, w)
-        margin = margin.reshape(b, 1, h, w)
-        prompt_presence = prompt_presence.transpose(1, 2).reshape(b, 1, h, w)
-        prompt_vs_null = prompt_vs_null.transpose(1, 2).reshape(b, 1, h, w)
-        sim_vs_null = sim_vs_null.reshape(b, 1, h, w)
-        return self.refine(torch.cat([x, max_sim, margin, prompt_presence, 0.5 * (prompt_vs_null + sim_vs_null)], dim=1))
+        sim_logits = torch.einsum("bnd,bkd->bnk", feat_tokens, scale_tokens)
+        null_sim_logits = torch.einsum("bnd,bkd->bnk", feat_tokens, null_scale_token)
+        sim_vs_null = (sim_logits - null_sim_logits).masked_fill(~class_mask.unsqueeze(1), -1e4)
+        sim_presence = sim_vs_null.sigmoid() * class_mask.unsqueeze(1).float()
+        instance_scale_tokens = F.normalize(instance_scale_tokens, dim=-1)
+        instance_sim_logits = torch.einsum("bnd,bid->bni", feat_tokens, instance_scale_tokens)
+        instance_sim_logits = instance_sim_logits.masked_fill(~instance_mask.unsqueeze(1), -1e4)
+        instance_sim_presence = (instance_sim_logits - null_sim_logits).sigmoid() * instance_mask.unsqueeze(1).float()
+        class_instance_sim_presence = self._aggregate_instance_scores(
+            instance_sim_presence,
+            instance_mask,
+            instance_class_indices,
+            class_prototypes.shape[1],
+        )
+        class_instance_sim_presence = class_instance_sim_presence * class_mask.unsqueeze(1).float()
+        combined_sim_presence = 0.5 * (sim_presence + class_instance_sim_presence)
+
+        active_class_count = class_mask.sum(dim=1, keepdim=True).clamp(min=1).float()
+        peak_prompt_presence = combined_class_presence.max(dim=-1).values.reshape(b, 1, h, w)
+        mean_prompt_presence = (combined_class_presence.sum(dim=-1) / active_class_count).reshape(b, 1, h, w)
+        peak_sim_presence = combined_sim_presence.max(dim=-1).values.reshape(b, 1, h, w)
+        mean_sim_presence = (combined_sim_presence.sum(dim=-1) / active_class_count).reshape(b, 1, h, w)
+        peak_instance_presence = instance_presence.max(dim=-1).values.reshape(b, 1, h, w)
+        peak_instance_sim_presence = instance_sim_presence.max(dim=-1).values.reshape(b, 1, h, w)
+        return self.refine(
+            torch.cat(
+                [
+                    x,
+                    peak_prompt_presence,
+                    mean_prompt_presence,
+                    peak_sim_presence,
+                    mean_sim_presence,
+                    peak_instance_presence,
+                    peak_instance_sim_presence,
+                ],
+                dim=1,
+            )
+        )
 
 
 class PromptFusionNeck(nn.Module):
@@ -104,5 +157,9 @@ class PromptFusionNeck(nn.Module):
                 prompt["class_prototypes"],
                 prompt["class_mask"],
                 prompt["scale_tokens"][name],
+                prompt["instance_prototypes"],
+                prompt["instance_class_indices"],
+                prompt["instance_mask"],
+                prompt["instance_scale_tokens"][name],
             )
         return outputs

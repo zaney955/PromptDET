@@ -53,6 +53,12 @@ def train(
     optimizer: torch.optim.Optimizer,
     config: PromptDetConfig,
 ) -> Dict[str, float]:
+    public_metric_names = {
+        "num_pos": "num_fg_anchors",
+        "num_neg": "num_bg_anchors",
+        "mean_pos_score": "mean_fg_score",
+        "mean_neg_score": "mean_bg_score",
+    }
     output_dir = Path(config.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,7 +121,6 @@ def train(
             prompt_class_indices = batch["prompt_class_indices"].to(device)
             prompt_instance_mask = batch["prompt_instance_mask"].to(device)
             prompt_class_mask = batch["prompt_class_mask"].to(device)
-            prompt_type = batch["prompt_type"].to(device)
             query_image = batch["query_image"].to(device)
             query_target_map = batch["query_target_map"].to(device)
             targets = _move_targets(batch["targets"], device)
@@ -136,7 +141,6 @@ def train(
                     prompt_instance_mask,
                     prompt_class_mask,
                     query_image,
-                    prompt_type,
                     query_target_map=query_target_map,
                     decode=True,
                 )
@@ -171,7 +175,10 @@ def train(
         scheduler.step()
         reduced_epoch_stats = reduce_dict(epoch_stats, average=False)
         total_steps = reduce_dict({"num_steps": float(num_steps)}, average=False)["num_steps"]
-        train_metrics = {key: value / max(total_steps, 1.0) for key, value in reduced_epoch_stats.items()}
+        train_metrics = {
+            public_metric_names.get(key, key): value / max(total_steps, 1.0)
+            for key, value in reduced_epoch_stats.items()
+        }
         summary = {"epoch": epoch, **train_metrics}
 
         if (epoch + 1) % config.train.eval_interval == 0:
@@ -179,14 +186,12 @@ def train(
                 model,
                 val_loader,
                 device=device,
-                conf_threshold=config.train.conf_threshold,
-                nms_iou_threshold=config.train.nms_iou_threshold,
-                pre_nms_topk=config.train.pre_nms_topk,
-                one2one_topk=config.train.one2one_topk,
-                one2one_peak_kernel=config.train.one2one_peak_kernel,
+                score_threshold=config.train.score_threshold,
+                pre_score_topk=config.train.pre_score_topk,
+                local_peak_kernel=config.train.local_peak_kernel,
                 oversize_box_threshold=config.train.oversize_box_threshold,
                 oversize_box_gamma=config.train.oversize_box_gamma,
-                max_det=config.train.max_det,
+                max_detections=config.train.max_detections,
             )
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})
             if val_metrics["f1"] >= best_f1 and is_main_process():

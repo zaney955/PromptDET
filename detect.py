@@ -46,18 +46,15 @@ def parse_args():
     parser.add_argument("--prompt-image", type=str, default=None)
     parser.add_argument("--prompt-box", type=float, nargs=4, default=None, help="normalized x_center y_center width height on the original prompt image")
     parser.add_argument("--prompt-label", type=int, default=None)
-    parser.add_argument("--task-type", type=str, default=None, choices=["same_category", "same_instance"])
     parser.add_argument("--query-image", type=str, required=True, help="Path to one query image or a directory of query images.")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--conf-threshold", type=float, default=None)
-    parser.add_argument("--nms-iou-threshold", type=float, default=None)
-    parser.add_argument("--pre-nms-topk", type=int, default=None)
-    parser.add_argument("--one2one-topk", type=int, default=None)
-    parser.add_argument("--one2one-peak-kernel", type=int, default=None)
+    parser.add_argument("--score-threshold", type=float, default=None)
+    parser.add_argument("--pre-score-topk", type=int, default=None)
+    parser.add_argument("--local-peak-kernel", type=int, default=None)
     parser.add_argument("--oversize-box-threshold", type=float, default=None)
     parser.add_argument("--oversize-box-gamma", type=float, default=None)
-    parser.add_argument("--max-det", type=int, default=None)
+    parser.add_argument("--max-detections", type=int, default=None)
     return parser.parse_args()
 
 
@@ -77,7 +74,6 @@ def _load_prompt_set(
     args,
     image_size: int,
     max_prompt_classes: int,
-    prompt_types: list[str],
     hint_inner_shrink: float,
     hint_bg_expand: float,
     random_color_min_distance: float,
@@ -87,7 +83,6 @@ def _load_prompt_set(
         prompt_spec_path = Path(args.prompt_spec).resolve()
         payload = json.loads(prompt_spec_path.read_text(encoding="utf-8"))
         prompts = payload["prompts"]
-        task_type = payload.get("task_type", args.task_type or "same_category")
     else:
         prompt_spec_path = None
         if args.prompt_image is None or args.prompt_box is None or args.prompt_label is None:
@@ -96,7 +91,6 @@ def _load_prompt_set(
             "image": args.prompt_image,
             "annotations": [{"bbox": args.prompt_box, "label": args.prompt_label}],
         }]
-        task_type = args.task_type or "same_category"
 
     prompt_images = []
     prompt_boxes = []
@@ -142,8 +136,6 @@ def _load_prompt_set(
         raise ValueError("Prompt set is empty.")
     if len(label_to_slot) > max_prompt_classes:
         raise ValueError("Prompt set exceeds model.max_prompt_classes.")
-    if task_type not in prompt_types:
-        raise ValueError(f"Unsupported task_type={task_type}. Valid types: {prompt_types}")
 
     prompt_class_ids = [None] * len(label_to_slot)
     for label, slot in label_to_slot.items():
@@ -170,7 +162,6 @@ def _load_prompt_set(
         "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long).unsqueeze(0),
         "prompt_class_mask": torch.ones((1, len(prompt_class_ids)), dtype=torch.bool),
         "slot_colors": slot_colors.unsqueeze(0),
-        "prompt_type": torch.tensor([prompt_types.index(task_type)], dtype=torch.long),
     }
 
 
@@ -180,14 +171,12 @@ def _run_single_query(
     query_path: Path,
     device: torch.device,
     image_size: int,
-    conf_threshold: float,
-    nms_iou_threshold: float,
-    pre_nms_topk: int,
-    one2one_topk: int,
-    one2one_peak_kernel: int,
+    score_threshold: float,
+    pre_score_topk: int,
+    local_peak_kernel: int,
     oversize_box_threshold: float,
     oversize_box_gamma: float,
-    max_det: int,
+    max_detections: int,
 ) -> tuple[Image.Image, dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
     query_pil = Image.open(query_path).convert("RGB")
     query_tensor = resize_image(query_pil, image_size).unsqueeze(0).to(device)
@@ -201,21 +190,18 @@ def _run_single_query(
             prompt_batch["prompt_instance_mask"].to(device),
             prompt_batch["prompt_class_mask"].to(device),
             query_tensor,
-            prompt_batch["prompt_type"].to(device),
         )
         preds = model.predict(
             raw,
             prompt_batch["prompt_class_ids"].to(device),
             prompt_batch["prompt_class_mask"].to(device),
             image_size=image_size,
-            conf_threshold=conf_threshold,
-            nms_iou_threshold=nms_iou_threshold,
-            pre_nms_topk=pre_nms_topk,
-            one2one_topk=one2one_topk,
-            one2one_peak_kernel=one2one_peak_kernel,
+            score_threshold=score_threshold,
+            pre_score_topk=pre_score_topk,
+            local_peak_kernel=local_peak_kernel,
             oversize_box_threshold=oversize_box_threshold,
             oversize_box_gamma=oversize_box_gamma,
-            max_det=max_det,
+            max_detections=max_detections,
         )[0]
 
     boxes = preds["boxes"].cpu()
@@ -230,22 +216,18 @@ def main():
     config = load_config(args.config)
     if args.device:
         config.train.device = args.device
-    if args.conf_threshold is not None:
-        config.train.conf_threshold = args.conf_threshold
-    if args.nms_iou_threshold is not None:
-        config.train.nms_iou_threshold = args.nms_iou_threshold
-    if args.pre_nms_topk is not None:
-        config.train.pre_nms_topk = args.pre_nms_topk
-    if args.one2one_topk is not None:
-        config.train.one2one_topk = args.one2one_topk
-    if args.one2one_peak_kernel is not None:
-        config.train.one2one_peak_kernel = args.one2one_peak_kernel
+    if args.score_threshold is not None:
+        config.train.score_threshold = args.score_threshold
+    if args.pre_score_topk is not None:
+        config.train.pre_score_topk = args.pre_score_topk
+    if args.local_peak_kernel is not None:
+        config.train.local_peak_kernel = args.local_peak_kernel
     if args.oversize_box_threshold is not None:
         config.train.oversize_box_threshold = args.oversize_box_threshold
     if args.oversize_box_gamma is not None:
         config.train.oversize_box_gamma = args.oversize_box_gamma
-    if args.max_det is not None:
-        config.train.max_det = args.max_det
+    if args.max_detections is not None:
+        config.train.max_detections = args.max_detections
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
 
     model = PromptDET(config.model, config.dense_grounding).to(device)
@@ -257,7 +239,6 @@ def main():
         args,
         config.model.image_size,
         config.model.max_prompt_classes,
-        config.model.prompt_types,
         config.dense_grounding.hint_inner_shrink,
         config.dense_grounding.hint_bg_expand,
         config.dense_grounding.random_color_min_distance,
@@ -277,14 +258,12 @@ def main():
             current_query_path,
             device=device,
             image_size=config.model.image_size,
-            conf_threshold=config.train.conf_threshold,
-            nms_iou_threshold=config.train.nms_iou_threshold,
-            pre_nms_topk=config.train.pre_nms_topk,
-            one2one_topk=config.train.one2one_topk,
-            one2one_peak_kernel=config.train.one2one_peak_kernel,
+            score_threshold=config.train.score_threshold,
+            pre_score_topk=config.train.pre_score_topk,
+            local_peak_kernel=config.train.local_peak_kernel,
             oversize_box_threshold=config.train.oversize_box_threshold,
             oversize_box_gamma=config.train.oversize_box_gamma,
-            max_det=config.train.max_det,
+            max_detections=config.train.max_detections,
         )
         payload = {
             "boxes": preds["boxes"].tolist(),
@@ -308,7 +287,6 @@ def main():
                 json.dumps(
                     {
                         "query_image": str(current_query_path),
-                        "task_type": config.model.prompt_types[int(prompt_batch["prompt_type"][0].item())],
                         "num_prompts": int(prompt_batch["prompt_images"].shape[1]),
                         "slot_colors": prompt_batch["slot_colors"][0].tolist(),
                     },

@@ -19,26 +19,35 @@
 
 ## Prompt Conditioning Rules
 - Prompt classes are represented by dynamically aggregated visual prototypes.
+- When multiple prompt instances belong to the same category, their features should be fused first to form a more stable category-level prompt representation.
+- Different prompt categories should not be forced to compete too early inside a shared prompt-conditioning path. Prefer category-wise conditional branches or other designs that keep cross-category interference low until late aggregation.
 - Prompt slot indices are randomized per episode. This is intentional and must be preserved.
 - Do not add logic that lets the model memorize fixed dataset `category_id -> slot` mappings.
 - Any new feature must continue to work when prompt classes appear:
   - in one image or many images
   - with one instance or multiple instances
-  - as same-class or mixed-class prompt sets
+  - as same-class, partially overlapping, or mixed-class prompt sets
 
 ## Sampling and Training Constraints
-- Sampling should continue to expose:
-  - positive episodes
-  - negative episodes
-  - mixed prompt-class episodes
-- Positive and negative training episodes should stay approximately balanced by design, rather than relying on uncontrolled random draws.
-- In `mixed` prompt mode, sampling should preserve that balance explicitly even when some prompt types can only generate positive episodes.
-- Positive query images should be chosen deliberately from images that contain prompt-defined categories in the label files.
+- Remove `same_instance`-specific sampling rules. Training should use a single class-conditioned prompt-set regime.
+- In each training episode, sample `min_prompt_classes` to `max_prompt_classes` categories to form the prompt set.
+- Prompt instances may come from one image or multiple images. A class may appear once or multiple times across the prompt set.
+- Query sampling should stay approximately balanced between positive and negative episodes by design, rather than relying on uncontrolled random draws.
+- Positive query images must contain one or more prompt-defined classes, but they do not need to contain every prompt-defined class.
 - When multiple positive query candidates exist, prefer images that:
   - cover more of the prompt-defined classes
   - contain more instances of those prompt-defined classes
   - avoid excessive unrelated objects when possible
-- Negative query images should be chosen from labeled images that contain no prompt-defined classes, not from unlabeled or semantically unknown images.
+- Negative query images must be chosen from labeled images that contain no prompt-defined classes.
+- During training, when the prompt set contains multiple categories:
+  - same-category prompt instances should be fused into a category-level representation
+  - different categories should be processed with separate category-conditional branches on the query side as much as practical
+- The training objective should teach the model both:
+  - prompt-conditioned detection of the prompt-defined categories
+  - empty output when the current query contains none of the prompt-defined categories
+- The purpose of this training regime is twofold:
+  - learn prompt-conditioned category detection
+  - learn empty-category rejection for the current prompt set
 - If adding new losses or assigners, preserve the distinction:
   - `one2many` improves optimization
   - `one2one` determines final prediction behavior
@@ -56,6 +65,14 @@
   instead of adding closed-set shortcuts.
 
 ## Inference Rules
+- Detection takes a prompt set built from one or more labeled images.
+- Each prompt image may contribute one or more selected categories as targets.
+- Selected categories across prompt images may be identical, partially overlapping, or completely different.
+- The same category may appear in multiple prompt images with multiple prompt instances.
+- At inference time, when multiple prompt instances belong to the same category, fuse them into a single, more stable category representation before matching on the query.
+- Different prompt categories should then be matched on the query through separate category-conditional branches or equivalent low-interference logic, rather than a single early shared competition step.
+- The model must dynamically infer the active target set from all selected prompt annotations and only return query detections that belong to those prompt-defined classes.
+- If a prompt-defined category is absent from the query image, that category's output should be empty.
 - The main inference path should be:
   - decode `one2one`
   - apply local peak filtering

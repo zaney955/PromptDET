@@ -17,15 +17,58 @@ from promptdet.utils.box_formats import xyxy_to_yolo_xywh
 
 
 CLASSES = [
-    ("red_square", (230, 70, 70), "square"),
-    ("blue_square", (70, 120, 230), "square"),
-    ("green_circle", (70, 190, 90), "circle"),
-    ("yellow_circle", (230, 200, 70), "circle"),
-    ("purple_triangle", (170, 90, 210), "triangle"),
-    ("cyan_triangle", (70, 200, 210), "triangle"),
-    ("orange_diamond", (230, 150, 80), "diamond"),
-    ("pink_diamond", (220, 110, 170), "diamond"),
+    "square",
+    "circle",
+    "triangle",
+    "diamond",
+    "pentagon",
+    "hexagon",
+    "star",
+    "cross",
 ]
+
+COLOR_PALETTE = [
+    (230, 70, 70),
+    (70, 120, 230),
+    (70, 190, 90),
+    (230, 200, 70),
+    (170, 90, 210),
+    (70, 200, 210),
+    (230, 150, 80),
+    (220, 110, 170),
+    (120, 120, 120),
+    (120, 70, 30),
+    (40, 160, 160),
+    (180, 80, 120),
+]
+
+
+def _regular_polygon_points(x1: float, y1: float, x2: float, y2: float, sides: int, rotation: float = 0.0):
+    import math
+
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    radius = min(x2 - x1, y2 - y1) / 2
+    points = []
+    for idx in range(sides):
+        angle = rotation + (2.0 * math.pi * idx / sides)
+        points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return points
+
+
+def _star_points(x1: float, y1: float, x2: float, y2: float, points_count: int = 5):
+    import math
+
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    outer_radius = min(x2 - x1, y2 - y1) / 2
+    inner_radius = outer_radius * 0.45
+    points = []
+    for idx in range(points_count * 2):
+        angle = -math.pi / 2 + idx * math.pi / points_count
+        radius = outer_radius if idx % 2 == 0 else inner_radius
+        points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return points
 
 
 def draw_shape(draw: ImageDraw.ImageDraw, bbox, color, shape):
@@ -45,6 +88,40 @@ def draw_shape(draw: ImageDraw.ImageDraw, bbox, color, shape):
         cy = (y1 + y2) / 2
         points = [(cx, y1), (x2, cy), (cx, y2), (x1, cy)]
         draw.polygon(points, fill=color)
+        return
+    if shape == "pentagon":
+        draw.polygon(_regular_polygon_points(x1, y1, x2, y2, sides=5, rotation=-1.57079632679), fill=color)
+        return
+    if shape == "hexagon":
+        draw.polygon(_regular_polygon_points(x1, y1, x2, y2, sides=6, rotation=-1.57079632679), fill=color)
+        return
+    if shape == "star":
+        draw.polygon(_star_points(x1, y1, x2, y2, points_count=5), fill=color)
+        return
+    if shape == "cross":
+        width = x2 - x1
+        height = y2 - y1
+        arm_w = width * 0.3
+        arm_h = height * 0.3
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        points = [
+            (cx - arm_w / 2, y1),
+            (cx + arm_w / 2, y1),
+            (cx + arm_w / 2, cy - arm_h / 2),
+            (x2, cy - arm_h / 2),
+            (x2, cy + arm_h / 2),
+            (cx + arm_w / 2, cy + arm_h / 2),
+            (cx + arm_w / 2, y2),
+            (cx - arm_w / 2, y2),
+            (cx - arm_w / 2, cy + arm_h / 2),
+            (x1, cy + arm_h / 2),
+            (x1, cy - arm_h / 2),
+            (cx - arm_w / 2, cy - arm_h / 2),
+        ]
+        draw.polygon(points, fill=color)
+        return
+    raise ValueError(f"Unsupported shape: {shape}")
 
 
 def sample_bbox(image_size: int, min_size: int = 28, max_size: int = 96):
@@ -65,13 +142,13 @@ def _write_split_list(output_dir: Path, split: str, file_names: list[str]) -> No
 
 def _write_classes_file(output_dir: Path) -> None:
     (output_dir / "classes.txt").write_text(
-        "\n".join(name for name, _, _ in CLASSES) + "\n",
+        "\n".join(CLASSES) + "\n",
         encoding="utf-8",
     )
 
 
 def _write_dataset_yaml(output_dir: Path) -> None:
-    names_rows = [f"  {idx}: {name}" for idx, (name, _, _) in enumerate(CLASSES)]
+    names_rows = [f"  {idx}: {name}" for idx, name in enumerate(CLASSES)]
     payload = [
         "path: .",
         "train: train.txt",
@@ -99,7 +176,8 @@ def build_split(output_dir: Path, split: str, num_images: int, image_size: int) 
         annotations = []
         for _ in range(num_objects):
             category_id = random.randint(0, len(CLASSES) - 1)
-            _, color, shape = CLASSES[category_id]
+            shape = CLASSES[category_id]
+            color = random.choice(COLOR_PALETTE)
             bbox_xyxy = sample_bbox(image_size)
             draw_shape(draw, bbox_xyxy, color, shape)
             bbox_yolo = _round_bbox(xyxy_to_yolo_xywh(bbox_xyxy, image_size, image_size))

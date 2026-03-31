@@ -23,7 +23,6 @@ class ModelConfig:
     logit_scale_init: float = 1.5
     max_logit_scale: float = 2.5
     detail_score_weight: float = 0.5
-    prompt_types: List[str] = field(default_factory=lambda: ["same_category", "same_instance", "part", "defect"])
 
 
 @dataclass
@@ -66,9 +65,7 @@ class DataConfig:
     max_prompt_classes: int = 3
     max_prompt_instances_per_class: int = 2
     max_prompt_images: int = 4
-    negative_ratio: float = 0.35
-    hard_negative_ratio: float = 0.35
-    same_instance_ratio: float = 0.1
+    negative_episode_ratio: float = 0.5
     episodes_per_epoch: int = 2000
     val_episodes: int = 300
     num_workers: int = 2
@@ -86,14 +83,12 @@ class TrainConfig:
     seed: int = 42
     mixed_precision: bool = True
     grad_clip: float = 5.0
-    conf_threshold: float = 0.15
-    nms_iou_threshold: float = 0.5
-    pre_nms_topk: int = 256
-    one2one_topk: int = 300
-    one2one_peak_kernel: int = 3
+    score_threshold: float = 0.15
+    pre_score_topk: int = 256
+    local_peak_kernel: int = 3
     oversize_box_threshold: float = 0.85
     oversize_box_gamma: float = 20.0
-    max_det: int = 100
+    max_detections: int = 100
     eval_interval: int = 1
     save_interval: int = 1
     resume: str = ""
@@ -117,7 +112,6 @@ class LossConfig:
     dfl_weight: float = 1.5
     duplicate_weight: float = 0.5
     non_target_weight: float = 1.0
-    confusable_non_target_weight: float = 2.0
     non_target_logit_margin: float = 0.0
     oversize_box_weight: float = 0.5
     oversize_box_threshold: float = 0.85
@@ -168,6 +162,23 @@ def load_config(path: str | Path | None) -> PromptDetConfig:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if "context_painter" in data and "dense_grounding" not in data:
         data["dense_grounding"] = data.pop("context_painter")
+    if "data" in data:
+        data["data"] = dict(data["data"])
+        if "negative_ratio" in data["data"] and "negative_episode_ratio" not in data["data"]:
+            data["data"]["negative_episode_ratio"] = data["data"].pop("negative_ratio")
+    if "train" in data:
+        data["train"] = dict(data["train"])
+        legacy_train_keys = {
+            "conf_threshold": "score_threshold",
+            "pre_nms_topk": "pre_score_topk",
+            "one2one_peak_kernel": "local_peak_kernel",
+            "max_det": "max_detections",
+        }
+        for old_key, new_key in legacy_train_keys.items():
+            if old_key in data["train"] and new_key not in data["train"]:
+                data["train"][new_key] = data["train"].pop(old_key)
+        data["train"].pop("nms_iou_threshold", None)
+        data["train"].pop("one2one_topk", None)
     return _update_dataclass(config, data)
 
 

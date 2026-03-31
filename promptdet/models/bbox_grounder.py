@@ -19,7 +19,6 @@ class BBoxPromptGrounder(nn.Module):
         channels: int,
         prompt_dim: int,
         max_prompt_classes: int,
-        prompt_types: list[str],
         image_size: int,
         cfg: DenseGroundingConfig,
     ):
@@ -35,7 +34,6 @@ class BBoxPromptGrounder(nn.Module):
             in_channels=channels,
             image_size=image_size,
             max_prompt_classes=max_prompt_classes,
-            prompt_types=prompt_types,
             cfg=cfg,
         )
         self.context_fuse = nn.ModuleDict({
@@ -137,7 +135,6 @@ class BBoxPromptGrounder(nn.Module):
         prompt_class_mask: torch.Tensor,
         query_feats: Dict[str, torch.Tensor],
         query_target_maps: torch.Tensor | None,
-        prompt_type: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         prompt_feat = prompt_feats[self.scale]
         hint_low = F.interpolate(
@@ -164,7 +161,6 @@ class BBoxPromptGrounder(nn.Module):
             prompt_instance_mask,
             query_feats[self.scale],
             query_target_maps,
-            prompt_type,
         )
         query_context_feat = painter_outputs["query_context_feat"]
         fused_feats = {}

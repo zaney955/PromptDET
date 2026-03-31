@@ -43,7 +43,6 @@ class PromptDET(nn.Module):
             prompt_dim=cfg.prompt_dim,
             out_channels=cfg.neck_channels,
             crop_size=cfg.prompt_crop_size,
-            prompt_types=cfg.prompt_types,
             label_dropout=cfg.label_dropout,
             max_prompt_classes=cfg.max_prompt_classes,
         )
@@ -52,7 +51,6 @@ class PromptDET(nn.Module):
             channels=cfg.neck_channels,
             prompt_dim=cfg.prompt_dim,
             max_prompt_classes=cfg.max_prompt_classes,
-            prompt_types=cfg.prompt_types,
             image_size=cfg.image_size,
             cfg=self.context_cfg,
         )
@@ -76,7 +74,6 @@ class PromptDET(nn.Module):
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
         query_image: torch.Tensor,
-        prompt_type: torch.Tensor,
         query_target_map: torch.Tensor | None = None,
         decode: bool = False,
     ) -> Dict[str, Dict[str, List[torch.Tensor]]] | Dict[str, Dict[str, torch.Tensor]]:
@@ -96,7 +93,6 @@ class PromptDET(nn.Module):
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
-            prompt_type,
         )
         query_feats = self.prompt_fusion(query_feats, prompt_encoding)
         grounding = self.grounder(
@@ -109,7 +105,6 @@ class PromptDET(nn.Module):
             prompt_class_mask,
             query_feats,
             query_target_map,
-            prompt_type,
         )
         class_detail_tokens = prompt_encoding["class_detail_tokens"]
         bsz, num_slots, num_tokens, dim = class_detail_tokens.shape
@@ -244,17 +239,13 @@ class PromptDET(nn.Module):
         prompt_class_ids: torch.Tensor,
         prompt_class_mask: torch.Tensor,
         image_size: int,
-        conf_threshold: float = 0.25,
-        nms_iou_threshold: float = 0.5,
-        pre_nms_topk: int = 256,
-        one2one_topk: int = 300,
-        one2one_peak_kernel: int = 3,
+        score_threshold: float = 0.25,
+        pre_score_topk: int = 256,
+        local_peak_kernel: int = 3,
         oversize_box_threshold: float = 0.85,
         oversize_box_gamma: float = 20.0,
-        max_det: int = 100,
+        max_detections: int = 100,
     ) -> List[Dict[str, torch.Tensor]]:
-        # Kept in the public API for config/CLI compatibility. The intended inference path remains NMS-free.
-        del nms_iou_threshold
         decoded = (
             outputs
             if "one2one" in outputs and "pred_boxes" in outputs["one2one"]
@@ -306,8 +297,8 @@ class PromptDET(nn.Module):
                 * pred_targetness[batch_idx]
             ).clamp(min=0.0).pow(1.0 / 3.0)
             scores = base_scores * (0.25 + 0.75 * prompt_vs_null)
-            if one2one_peak_kernel > 1:
-                pad = one2one_peak_kernel // 2
+            if local_peak_kernel > 1:
+                pad = local_peak_kernel // 2
                 level_keep = []
                 start = 0
                 for h, w in feature_shapes:
@@ -315,7 +306,7 @@ class PromptDET(nn.Module):
                     score_map = scores[start:start + count].view(1, 1, h, w)
                     peak_mask = F.max_pool2d(
                         score_map,
-                        kernel_size=one2one_peak_kernel,
+                        kernel_size=local_peak_kernel,
                         stride=1,
                         padding=pad,
                     ).eq(score_map)
@@ -327,23 +318,19 @@ class PromptDET(nn.Module):
             boxes = boxes[keep]
             class_index = class_index[keep]
             scores = scores[keep]
-            if scores.numel() > pre_nms_topk:
-                topk_scores, topk_idx = torch.topk(scores, k=pre_nms_topk)
+            if scores.numel() > pre_score_topk:
+                topk_scores, topk_idx = torch.topk(scores, k=pre_score_topk)
                 boxes = boxes[topk_idx]
                 class_index = class_index[topk_idx]
                 scores = topk_scores
             if boxes.numel() > 0:
                 size_penalty = oversize_box_penalty(boxes, image_size=image_size, area_threshold=oversize_box_threshold)
                 scores = scores * torch.exp(-oversize_box_gamma * size_penalty)
-            keep = scores > conf_threshold
+            keep = scores > score_threshold
             boxes = clamp_boxes(boxes[keep], image_size, image_size)
             scores = scores[keep]
             labels = valid_class_ids[class_index[keep]]
-            if scores.numel() > one2one_topk:
-                scores, top_idx = torch.topk(scores, k=one2one_topk)
-                boxes = boxes[top_idx]
-                labels = labels[top_idx]
-            order = scores.argsort(descending=True)[:max_det]
+            order = scores.argsort(descending=True)[:max_detections]
             results.append({
                 "boxes": boxes[order],
                 "scores": scores[order],

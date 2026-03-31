@@ -33,7 +33,6 @@ class PromptContextPainter(nn.Module):
         in_channels: int,
         image_size: int,
         max_prompt_classes: int,
-        prompt_types: list[str],
         cfg: DenseGroundingConfig,
     ):
         super().__init__()
@@ -77,7 +76,6 @@ class PromptContextPainter(nn.Module):
         self.target_segment = nn.Parameter(torch.zeros(1, 1, cfg.dim))
         self.prompt_segment = nn.Parameter(torch.zeros(1, 1, cfg.dim))
         self.query_segment = nn.Parameter(torch.zeros(1, 1, cfg.dim))
-        self.type_embed = nn.Embedding(len(prompt_types), cfg.dim)
 
         self.blocks = nn.ModuleList([ContextPainterBlock(cfg.dim, cfg.num_heads) for _ in range(cfg.depth)])
         self._init_parameters()
@@ -120,7 +118,6 @@ class PromptContextPainter(nn.Module):
         prompt_instance_mask: torch.Tensor,
         query_feat: torch.Tensor,
         query_target_maps: torch.Tensor | None,
-        prompt_type: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         batch_size, num_instances, channels, height, width = prompt_feat.shape
         seq_len = height * width
@@ -156,29 +153,24 @@ class PromptContextPainter(nn.Module):
         query_tgt_tokens = self.target_proj(masked_query_target).unsqueeze(1).expand(batch_size, num_instances, self.dim, height, width)
         query_mask_tokens = query_mask.unsqueeze(1).expand(batch_size, num_instances, 1, height, width)
 
-        type_token = self.type_embed(prompt_type).view(batch_size, 1, self.dim, 1, 1)
         prompt_img_tokens = (
             prompt_img_tokens
-            + type_token
             + self.image_segment.view(1, 1, self.dim, 1, 1)
             + self.prompt_segment.view(1, 1, self.dim, 1, 1)
         )
         prompt_tgt_tokens = (
             prompt_tgt_tokens
-            + type_token
             + self.target_segment.view(1, 1, self.dim, 1, 1)
             + self.prompt_segment.view(1, 1, self.dim, 1, 1)
         )
         query_img_tokens = (
             query_img_tokens
-            + type_token
             + self.image_segment.view(1, 1, self.dim, 1, 1)
             + self.query_segment.view(1, 1, self.dim, 1, 1)
         )
         query_tgt_tokens = (
             query_tgt_tokens
             + query_mask_tokens * self.mask_token.view(1, 1, self.dim, 1, 1)
-            + type_token
             + self.target_segment.view(1, 1, self.dim, 1, 1)
             + self.query_segment.view(1, 1, self.dim, 1, 1)
         )

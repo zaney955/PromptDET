@@ -14,14 +14,12 @@ def evaluate(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    conf_threshold: float,
-    nms_iou_threshold: float,
-    pre_nms_topk: int,
-    one2one_topk: int,
-    one2one_peak_kernel: int,
+    score_threshold: float,
+    pre_score_topk: int,
+    local_peak_kernel: int,
     oversize_box_threshold: float,
     oversize_box_gamma: float,
-    max_det: int,
+    max_detections: int,
 ) -> Dict[str, float]:
     model.eval()
     model_without_ddp = unwrap_model(model)
@@ -37,7 +35,6 @@ def evaluate(
         prompt_instance_mask = batch["prompt_instance_mask"].to(device)
         prompt_class_ids = batch["prompt_class_ids"].to(device)
         prompt_class_mask = batch["prompt_class_mask"].to(device)
-        prompt_type = batch["prompt_type"].to(device)
         query_image = batch["query_image"].to(device)
 
         raw = model(
@@ -49,21 +46,18 @@ def evaluate(
             prompt_instance_mask,
             prompt_class_mask,
             query_image,
-            prompt_type,
         )
         preds = model_without_ddp.predict(
             raw,
             prompt_class_ids,
             prompt_class_mask,
             image_size=query_image.shape[-1],
-            conf_threshold=conf_threshold,
-            nms_iou_threshold=nms_iou_threshold,
-            pre_nms_topk=pre_nms_topk,
-            one2one_topk=one2one_topk,
-            one2one_peak_kernel=one2one_peak_kernel,
+            score_threshold=score_threshold,
+            pre_score_topk=pre_score_topk,
+            local_peak_kernel=local_peak_kernel,
             oversize_box_threshold=oversize_box_threshold,
             oversize_box_gamma=oversize_box_gamma,
-            max_det=max_det,
+            max_detections=max_detections,
         )
         for pred, target in zip(preds, batch["targets"]):
             items.append(
@@ -91,7 +85,7 @@ def evaluate(
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
     }

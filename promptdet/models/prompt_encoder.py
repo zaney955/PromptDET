@@ -55,7 +55,6 @@ class PromptEncoder(nn.Module):
         prompt_dim: int,
         out_channels: int,
         crop_size: int,
-        prompt_types: list[str],
         label_dropout: float,
         max_prompt_classes: int,
     ):
@@ -76,7 +75,6 @@ class PromptEncoder(nn.Module):
         self.global_proj = nn.Linear(out_channels * 2 + 4, prompt_dim)
         self.class_slot_embed = nn.Embedding(max_prompt_classes, prompt_dim)
         self.local_slot_proj = nn.Linear(prompt_dim, out_channels)
-        self.type_embed = nn.Embedding(len(prompt_types), prompt_dim)
         self.scale_proj = nn.ModuleDict({
             "p3": nn.Linear(prompt_dim, out_channels),
             "p4": nn.Linear(prompt_dim, out_channels),
@@ -92,7 +90,6 @@ class PromptEncoder(nn.Module):
         prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
-        prompt_type: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         batch_size, num_instances, _, image_h, image_w = prompt_images.shape
         if prompt_class_mask.shape[1] > self.max_prompt_classes:
@@ -128,8 +125,7 @@ class PromptEncoder(nn.Module):
         if self.training and self.label_dropout > 0:
             keep = (torch.rand_like(prompt_instance_mask.float()) > self.label_dropout).unsqueeze(-1)
             class_slot_embed = class_slot_embed * keep
-        type_embed = self.type_embed(prompt_type).unsqueeze(1).expand_as(class_slot_embed)
-        instance_global = self.refine(prompt_vec + class_slot_embed + type_embed)
+        instance_global = self.refine(prompt_vec + class_slot_embed)
         local_tokens = local_tokens + self.local_slot_proj(class_slot_embed).unsqueeze(2)
 
         instance_mask = prompt_instance_mask.float()
@@ -143,6 +139,11 @@ class PromptEncoder(nn.Module):
         class_prototypes = torch.einsum("bpk,bpd->bkd", class_assign, instance_global) / class_counts.unsqueeze(-1)
         class_local_tokens = torch.einsum("bpk,bplc->bklc", class_assign, local_tokens)
         class_local_tokens = class_local_tokens / class_counts.unsqueeze(-1).unsqueeze(-1)
+        instance_class_indices = torch.where(
+            prompt_instance_mask,
+            class_indices,
+            torch.full_like(class_indices, -1),
+        )
 
         padded_class_mask = torch.zeros(
             (batch_size, self.max_prompt_classes),
@@ -155,12 +156,21 @@ class PromptEncoder(nn.Module):
         class_detail_tokens = self.detail_proj(class_local_tokens)
         class_detail_tokens = class_detail_tokens * padded_class_mask.unsqueeze(-1).unsqueeze(-1)
 
-        memory_mask = padded_class_mask.unsqueeze(-1).expand(batch_size, self.max_prompt_classes, token_count)
-        memory_tokens = class_local_tokens.reshape(batch_size, self.max_prompt_classes * token_count, -1)
-        memory_mask = memory_mask.reshape(batch_size, self.max_prompt_classes * token_count)
+        class_memory_mask = padded_class_mask.unsqueeze(-1).expand(batch_size, self.max_prompt_classes, token_count)
+        class_memory_tokens = class_local_tokens.reshape(batch_size, self.max_prompt_classes * token_count, -1)
+        class_memory_mask = class_memory_mask.reshape(batch_size, self.max_prompt_classes * token_count)
+        instance_memory_mask = prompt_instance_mask.unsqueeze(-1).expand(batch_size, num_instances, token_count)
+        instance_memory_tokens = local_tokens.reshape(batch_size, num_instances * token_count, -1)
+        instance_memory_mask = instance_memory_mask.reshape(batch_size, num_instances * token_count)
+        memory_tokens = torch.cat([class_memory_tokens, instance_memory_tokens], dim=1)
+        memory_mask = torch.cat([class_memory_mask, instance_memory_mask], dim=1)
 
         scale_tokens = {
             name: proj(class_prototypes) * padded_class_mask.unsqueeze(-1)
+            for name, proj in self.scale_proj.items()
+        }
+        instance_scale_tokens = {
+            name: proj(instance_global) * prompt_instance_mask.unsqueeze(-1).float()
             for name, proj in self.scale_proj.items()
         }
 
@@ -171,4 +181,8 @@ class PromptEncoder(nn.Module):
             "class_detail_tokens": class_detail_tokens,
             "class_mask": padded_class_mask,
             "scale_tokens": scale_tokens,
+            "instance_prototypes": instance_global,
+            "instance_class_indices": instance_class_indices,
+            "instance_mask": prompt_instance_mask,
+            "instance_scale_tokens": instance_scale_tokens,
         }
