@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List
 
 import torch
@@ -194,12 +195,6 @@ class PromptTaskAlignedAssigner:
             if candidate_inds.numel() == 0:
                 continue
 
-            prior_keep = pred_slot_priors[candidate_inds, class_idx] >= self.prior_threshold
-            if prior_keep.any():
-                candidate_inds = candidate_inds[prior_keep]
-            if candidate_inds.numel() == 0:
-                continue
-
             candidate_boxes = pred_boxes[candidate_inds]
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
@@ -285,12 +280,6 @@ class PromptOneToOneAssigner:
             candidate_inds = torch.nonzero(inside & center_mask, as_tuple=False).squeeze(1)
             if candidate_inds.numel() == 0:
                 candidate_inds = torch.nonzero(inside, as_tuple=False).squeeze(1)
-            if candidate_inds.numel() == 0:
-                continue
-
-            prior_keep = pred_slot_priors[candidate_inds, class_idx] >= self.prior_threshold
-            if prior_keep.any():
-                candidate_inds = candidate_inds[prior_keep]
             if candidate_inds.numel() == 0:
                 continue
 
@@ -450,15 +439,43 @@ class PromptDetectionLoss(torch.nn.Module):
                 gamma=self.cfg.focal_gamma,
                 reduction="mean",
             )
-            total_null = total_null + F.binary_cross_entropy_with_logits(
-                pred_null_logits[batch_idx],
-                (~assign.fg_mask).float(),
-                reduction="mean",
-            )
-
             pred_prob = pred_scores[batch_idx].sigmoid()
             pred_obj = pred_objectness[batch_idx].sigmoid()
             pred_tgt = pred_targetness[batch_idx].sigmoid()
+            null_terms = []
+            if assign.fg_mask.any():
+                null_terms.append(
+                    F.binary_cross_entropy_with_logits(
+                        pred_null_logits[batch_idx][assign.fg_mask],
+                        torch.zeros_like(pred_null_logits[batch_idx][assign.fg_mask]),
+                        reduction="mean",
+                    )
+                )
+            neg_mask = ~assign.fg_mask
+            if neg_mask.any():
+                neg_joint_scores = (
+                    pred_obj[neg_mask]
+                    * pred_tgt[neg_mask]
+                    * pred_prob[neg_mask][:, valid_class_mask].max(dim=-1).values
+                ).clamp(min=0.0)
+                hard_limit = max(
+                    self.cfg.null_min_negatives,
+                    int(math.ceil(assign.fg_mask.sum().item() * self.cfg.null_neg_pos_ratio)),
+                )
+                hard_limit = min(hard_limit, int(neg_joint_scores.numel()))
+                if hard_limit > 0:
+                    hard_idx = torch.topk(neg_joint_scores, k=hard_limit).indices
+                    hard_neg_logits = pred_null_logits[batch_idx][neg_mask][hard_idx]
+                    null_terms.append(
+                        F.binary_cross_entropy_with_logits(
+                            hard_neg_logits,
+                            torch.ones_like(hard_neg_logits),
+                            reduction="mean",
+                        )
+                    )
+            if null_terms:
+                total_null = total_null + torch.stack(null_terms).mean()
+
             if assign.fg_mask.any():
                 pos_boxes = pred_boxes[batch_idx][assign.fg_mask]
                 tgt_boxes = assign.target_boxes[assign.fg_mask]
@@ -565,7 +582,6 @@ class PromptDetectionLoss(torch.nn.Module):
                         region_weights,
                     )
 
-            neg_mask = ~assign.fg_mask
             neg_count = int(neg_mask.sum().item())
             if neg_count > 0:
                 total_neg += neg_count
@@ -580,13 +596,14 @@ class PromptDetectionLoss(torch.nn.Module):
 
             oversize_idx = torch.nonzero(~assign.fg_mask, as_tuple=False).squeeze(1)
             if oversize_idx.numel() > 0:
-                topk = min(self.cfg.oversize_box_topk, oversize_idx.numel())
-                oversize_idx = oversize_idx[:topk]
-                total_box_prior = total_box_prior + self.cfg.oversize_box_weight * oversize_box_penalty(
+                oversize_penalties = oversize_box_penalty(
                     pred_boxes[batch_idx][oversize_idx],
                     image_size=target["image_size"],
                     area_threshold=self.cfg.oversize_box_threshold,
-                ).mean()
+                )
+                topk = min(self.cfg.oversize_box_topk, oversize_penalties.numel())
+                topk_idx = torch.topk(oversize_penalties, k=topk).indices
+                total_box_prior = total_box_prior + self.cfg.oversize_box_weight * oversize_penalties[topk_idx].mean()
 
         num_batches = max(len(targets), 1)
         return {

@@ -96,6 +96,7 @@ def main():
         center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
+        seed=None,
     )
     val_dataset = PromptEpisodeDataset(
         image_list_path=config.data.val_list,
@@ -115,6 +116,7 @@ def main():
         center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
+        seed=config.train.seed + 100_000,
     )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if dist_info["distributed"] else None

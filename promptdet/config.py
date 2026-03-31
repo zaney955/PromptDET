@@ -127,6 +127,8 @@ class LossConfig:
     focal_gamma: float = 2.0
     classification_margin: float = 0.2
     center_target_sigma: float = 0.35
+    null_neg_pos_ratio: float = 16.0
+    null_min_negatives: int = 32
     one2many_weight: float = 1.0
     one2one_weight: float = 1.5
 

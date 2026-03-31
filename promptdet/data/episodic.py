@@ -63,6 +63,7 @@ class PromptEpisodeDataset(Dataset):
         center_target_sigma: float = 0.35,
         hint_inner_shrink: float = 0.6,
         hint_bg_expand: float = 0.12,
+        seed: int | None = None,
     ):
         super().__init__()
         self.labels_dir = Path(labels_dir)
@@ -81,6 +82,7 @@ class PromptEpisodeDataset(Dataset):
         self.center_target_sigma = center_target_sigma
         self.hint_inner_shrink = hint_inner_shrink
         self.hint_bg_expand = hint_bg_expand
+        self.seed = seed
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -142,31 +144,36 @@ class PromptEpisodeDataset(Dataset):
         path = Path(self.image_records[image_id]["path"])
         return Image.open(path).convert("RGB")
 
-    def _choose_prompt_type(self) -> int:
+    def _choose_prompt_type(self, rng: random.Random) -> int:
         if self.prompt_type == "same_category":
             return 0
         if self.prompt_type == "same_instance":
             return 1
-        return 1 if random.random() < self.same_instance_ratio else 0
+        return 1 if rng.random() < self.same_instance_ratio else 0
 
-    def _sample_prompt_classes(self, prompt_type_id: int) -> List[int]:
+    def _sample_prompt_classes(self, prompt_type_id: int, rng: random.Random) -> List[int]:
         if prompt_type_id == 1:
-            return [random.choice(self.classes)]
+            return [rng.choice(self.classes)]
         max_classes = min(self.max_prompt_classes, len(self.classes))
         min_classes = min(self.min_prompt_classes, max_classes)
-        count = random.randint(min_classes, max_classes)
-        return random.sample(self.classes, count)
+        count = rng.randint(min_classes, max_classes)
+        return rng.sample(self.classes, count)
 
-    def _sample_prompt_instances(self, prompt_class_ids: List[int], class_to_slot: Dict[int, int]) -> List[dict]:
+    def _sample_prompt_instances(
+        self,
+        prompt_class_ids: List[int],
+        class_to_slot: Dict[int, int],
+        rng: random.Random,
+    ) -> List[dict]:
         selected_instances: List[dict] = []
         used_image_ids: set[int] = set()
         used_ann_ids: set[int] = set()
         for class_id in prompt_class_ids:
             class_slot = class_to_slot[class_id]
             image_ids = list(self.class_to_image_ids[class_id])
-            random.shuffle(image_ids)
+            rng.shuffle(image_ids)
             max_instances = min(self.max_prompt_instances_per_class, max(len(self.class_to_anns[class_id]), 1))
-            target_instances = random.randint(1, max_instances)
+            target_instances = rng.randint(1, max_instances)
             class_instances: List[dict] = []
             for image_id in image_ids:
                 if len(class_instances) >= target_instances:
@@ -176,7 +183,7 @@ class PromptEpisodeDataset(Dataset):
                 candidates = [ann for ann in self.class_image_to_anns[class_id][image_id] if ann["id"] not in used_ann_ids]
                 if not candidates:
                     candidates = self.class_image_to_anns[class_id][image_id]
-                ann = random.choice(candidates)
+                ann = rng.choice(candidates)
                 used_image_ids.add(image_id)
                 used_ann_ids.add(ann["id"])
                 class_instances.append({
@@ -186,7 +193,7 @@ class PromptEpisodeDataset(Dataset):
                     "category_id": class_id,
                 })
             if not class_instances:
-                ann = random.choice(self.class_to_anns[class_id])
+                ann = rng.choice(self.class_to_anns[class_id])
                 class_instances.append({
                     "image_id": ann["image_id"],
                     "bbox": ann["bbox"],
@@ -216,7 +223,13 @@ class PromptEpisodeDataset(Dataset):
         confusable = sum(1 for ann in anns if ann["category_id"] in self._get_confusable_classes(list(prompt_class_set)))
         return cover, target_instances, -unrelated, -confusable
 
-    def _select_positive_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int], allow_same_image: bool) -> int | None:
+    def _select_positive_query(
+        self,
+        prompt_class_ids: List[int],
+        prompt_image_ids: List[int],
+        allow_same_image: bool,
+        rng: random.Random,
+    ) -> int | None:
         prompt_class_set = set(prompt_class_ids)
         prompt_image_set = set(prompt_image_ids)
         candidates = sorted(set().union(*(self.class_to_image_ids[class_id] for class_id in prompt_class_ids)))
@@ -226,9 +239,14 @@ class PromptEpisodeDataset(Dataset):
             return None
         ranked = sorted(candidates, key=lambda image_id: self._score_positive_query(image_id, prompt_class_set), reverse=True)
         shortlist = ranked[: min(len(ranked), 3)]
-        return random.choice(shortlist)
+        return rng.choice(shortlist)
 
-    def _select_negative_query(self, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> int | None:
+    def _select_negative_query(
+        self,
+        prompt_class_ids: List[int],
+        prompt_image_ids: List[int],
+        rng: random.Random,
+    ) -> int | None:
         prompt_class_set = set(prompt_class_ids)
         prompt_image_set = set(prompt_image_ids)
         confusable_class_set = self._get_confusable_classes(prompt_class_ids)
@@ -245,7 +263,7 @@ class PromptEpisodeDataset(Dataset):
             if self.image_to_class_ids[image_id] & confusable_class_set
         ]
         hard_negative_ids = [image_id for image_id in negative_ids if len(self.image_to_class_ids[image_id]) > 0]
-        sample = random.random()
+        sample = rng.random()
         if sample < self.hard_negative_ratio:
             pool = confusable_negative_ids or hard_negative_ids or negative_ids
         elif sample < self.hard_negative_ratio + self.negative_ratio:
@@ -253,16 +271,22 @@ class PromptEpisodeDataset(Dataset):
         else:
             return None
         pool = sorted(pool, key=lambda image_id: len(self.image_to_anns[image_id]), reverse=True)
-        return random.choice(pool[: min(len(pool), 3)])
+        return rng.choice(pool[: min(len(pool), 3)])
 
-    def _sample_query(self, prompt_type_id: int, prompt_class_ids: List[int], prompt_image_ids: List[int]) -> Tuple[int, bool]:
-        positive_id = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=False)
-        negative_id = self._select_negative_query(prompt_class_ids, prompt_image_ids)
+    def _sample_query(
+        self,
+        prompt_type_id: int,
+        prompt_class_ids: List[int],
+        prompt_image_ids: List[int],
+        rng: random.Random,
+    ) -> Tuple[int, bool]:
+        positive_id = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=False, rng=rng)
+        negative_id = self._select_negative_query(prompt_class_ids, prompt_image_ids, rng=rng)
 
         if prompt_type_id == 1:
             if positive_id is not None:
                 return positive_id, True
-            fallback_positive = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=True)
+            fallback_positive = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=True, rng=rng)
             if fallback_positive is not None:
                 return fallback_positive, True
 
@@ -271,25 +295,33 @@ class PromptEpisodeDataset(Dataset):
         if positive_id is not None:
             return positive_id, True
 
-        fallback_positive = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=True)
+        fallback_positive = self._select_positive_query(prompt_class_ids, prompt_image_ids, allow_same_image=True, rng=rng)
         if fallback_positive is not None:
             return fallback_positive, True
-        return random.choice(self.image_ids), False
+        return rng.choice(self.image_ids), False
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        prompt_type_id = self._choose_prompt_type()
-        sampled_prompt_class_ids = self._sample_prompt_classes(prompt_type_id)
-        slot_order = random.sample(range(len(sampled_prompt_class_ids)), len(sampled_prompt_class_ids))
+        rng = random.Random(self.seed + index) if self.seed is not None else random
+        prompt_type_id = self._choose_prompt_type(rng)
+        sampled_prompt_class_ids = self._sample_prompt_classes(prompt_type_id, rng)
+        slot_order = rng.sample(range(len(sampled_prompt_class_ids)), len(sampled_prompt_class_ids))
         class_to_slot = {class_id: slot_order[idx] for idx, class_id in enumerate(sampled_prompt_class_ids)}
         prompt_class_ids = [-1] * len(sampled_prompt_class_ids)
         for class_id, slot in class_to_slot.items():
             prompt_class_ids[slot] = class_id
 
-        prompt_instances = self._sample_prompt_instances(sampled_prompt_class_ids, class_to_slot)
+        prompt_instances = self._sample_prompt_instances(sampled_prompt_class_ids, class_to_slot, rng)
         prompt_image_ids = [instance["image_id"] for instance in prompt_instances]
-        query_image_id, positive = self._sample_query(prompt_type_id, sampled_prompt_class_ids, prompt_image_ids)
+        query_image_id, positive = self._sample_query(prompt_type_id, sampled_prompt_class_ids, prompt_image_ids, rng)
 
-        slot_colors = sample_slot_colors(len(sampled_prompt_class_ids), min_distance=self.color_min_distance)
+        color_generator = None
+        if self.seed is not None:
+            color_generator = torch.Generator().manual_seed(self.seed + index)
+        slot_colors = sample_slot_colors(
+            len(sampled_prompt_class_ids),
+            min_distance=self.color_min_distance,
+            generator=color_generator,
+        )
         prompt_images = []
         prompt_boxes = []
         prompt_hint_maps = []

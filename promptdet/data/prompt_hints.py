@@ -142,7 +142,11 @@ def build_query_detection_targets(
     return slot_target, fg_target, center_target, valid_mask, target_map
 
 
-def sample_slot_colors(num_slots: int, min_distance: float = 0.45) -> torch.Tensor:
+def sample_slot_colors(
+    num_slots: int,
+    min_distance: float = 0.45,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     if num_slots <= 0:
         return torch.zeros((0, 3), dtype=torch.float32)
     base = torch.tensor(
@@ -165,7 +169,7 @@ def sample_slot_colors(num_slots: int, min_distance: float = 0.45) -> torch.Tens
         else:
             accepted = False
             for _ in range(64):
-                candidate = torch.rand(3) * 0.85 + 0.1
+                candidate = torch.rand(3, generator=generator) * 0.85 + 0.1
                 if not colors:
                     accepted = True
                     break

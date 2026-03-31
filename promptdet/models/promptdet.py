@@ -299,13 +299,13 @@ class PromptDET(nn.Module):
 
             class_scores_max, class_index = valid_scores.max(dim=1)
             class_logits_max = valid_logits.gather(1, class_index.unsqueeze(1)).squeeze(1)
-            prompt_vs_null = (class_logits_max - pred_null_logits[batch_idx]).sigmoid()
-            scores = (
+            prompt_vs_null = (0.5 * (class_logits_max - pred_null_logits[batch_idx])).sigmoid()
+            base_scores = (
                 class_scores_max
                 * pred_objectness[batch_idx]
                 * pred_targetness[batch_idx]
-                * prompt_vs_null
-            ).clamp(min=0.0).pow(0.25)
+            ).clamp(min=0.0).pow(1.0 / 3.0)
+            scores = base_scores * (0.25 + 0.75 * prompt_vs_null)
             if one2one_peak_kernel > 1:
                 pad = one2one_peak_kernel // 2
                 level_keep = []

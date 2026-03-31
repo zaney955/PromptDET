@@ -40,7 +40,7 @@ class PromptContextPainter(nn.Module):
         self.image_size = image_size
         self.max_prompt_classes = max_prompt_classes
         self.dim = cfg.dim
-        self.feature_ensemble_start = cfg.feature_ensemble_start
+        self.feature_ensemble_start = min(max(int(cfg.feature_ensemble_start), 0), max(int(cfg.depth) - 1, 0))
         self.query_mask_ratio = float(cfg.query_mask_ratio)
         self.target_channels = int(cfg.target_channels)
 
