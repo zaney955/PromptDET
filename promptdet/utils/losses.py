@@ -39,6 +39,16 @@ def sigmoid_varifocal_loss(
     return loss
 
 
+def safe_prob_bce(
+    prob: torch.Tensor,
+    targets: torch.Tensor,
+    reduction: str = "mean",
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    logits = torch.logit(prob.clamp(min=eps, max=1.0 - eps))
+    return F.binary_cross_entropy_with_logits(logits, targets, reduction=reduction)
+
+
 def weighted_mean(loss: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     while weights.dim() < loss.dim():
         weights = weights.unsqueeze(-1)
@@ -384,6 +394,7 @@ class PromptDetectionLoss(torch.nn.Module):
         total_dfl = pred_scores.new_tensor(0.0)
         total_box_prior = pred_scores.new_tensor(0.0)
         total_contrast = pred_scores.new_tensor(0.0)
+        total_joint_score = pred_scores.new_tensor(0.0)
         total_pos = 0
         total_neg = 0
         total_pos_score_sum = pred_scores.new_tensor(0.0)
@@ -442,6 +453,8 @@ class PromptDetectionLoss(torch.nn.Module):
             pred_prob = pred_scores[batch_idx].sigmoid()
             pred_obj = pred_objectness[batch_idx].sigmoid()
             pred_tgt = pred_targetness[batch_idx].sigmoid()
+            prompt_gate = (valid_logits - pred_null_logits[batch_idx].unsqueeze(-1)).sigmoid()
+            joint_scores = (pred_prob[:, valid_class_mask] * pred_obj.unsqueeze(-1) * pred_tgt.unsqueeze(-1) * prompt_gate).clamp(1e-6, 1.0 - 1e-6)
             null_terms = []
             hard_neg_prompt_logits = None
             hard_neg_null_logits = None
@@ -505,6 +518,11 @@ class PromptDetectionLoss(torch.nn.Module):
                     (pred_obj[assign.fg_mask] * pred_tgt[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]).clamp(min=0.0)
                 )
                 total_pos_score_sum = total_pos_score_sum + pos_joint_scores.sum()
+                total_joint_score = total_joint_score + safe_prob_bce(
+                    joint_scores[assign.fg_mask].gather(1, pos_labels.unsqueeze(1)).squeeze(1),
+                    assign.target_scores[assign.fg_mask, pos_labels].clamp(min=0.1, max=1.0),
+                    reduction="mean",
+                )
 
                 pos_logits = box_logits[batch_idx][assign.fg_mask]
                 tgt_dist = bbox2dist(anchor_points[assign.fg_mask], tgt_boxes, self.reg_max, stride_tensor[assign.fg_mask])
@@ -536,6 +554,11 @@ class PromptDetectionLoss(torch.nn.Module):
                     dup_zero,
                     alpha=self.cfg.focal_alpha,
                     gamma=self.cfg.focal_gamma,
+                    reduction="mean",
+                )
+                total_joint_score = total_joint_score + self.cfg.duplicate_weight * safe_prob_bce(
+                    joint_scores[assign.duplicate_mask].max(dim=-1).values,
+                    torch.zeros_like(pred_objectness[batch_idx][assign.duplicate_mask]),
                     reduction="mean",
                 )
 
@@ -600,6 +623,14 @@ class PromptDetectionLoss(torch.nn.Module):
                         ),
                         region_weights,
                     )
+                    total_joint_score = total_joint_score + weighted_mean(
+                        safe_prob_bce(
+                            joint_scores[non_target_mask].max(dim=-1).values,
+                            torch.zeros_like(non_target_prompt_logits),
+                            reduction="none",
+                        ),
+                        region_weights,
+                    )
                 non_target_priors = pred_slot_priors[batch_idx][non_target_mask][:, valid_class_mask]
                 if non_target_priors.numel() > 0:
                     total_box_prior = total_box_prior + 0.25 * weighted_mean(
@@ -618,6 +649,11 @@ class PromptDetectionLoss(torch.nn.Module):
                         * neg_scores.max(dim=-1).values
                     ).clamp(min=0.0).pow(1.0 / 3.0)
                     total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
+                    total_joint_score = total_joint_score + safe_prob_bce(
+                        joint_scores[neg_mask].max(dim=-1).values,
+                        torch.zeros_like(neg_joint_scores),
+                        reduction="mean",
+                    )
 
             oversize_idx = torch.nonzero(~assign.fg_mask, as_tuple=False).squeeze(1)
             if oversize_idx.numel() > 0:
@@ -640,6 +676,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_dfl": total_dfl / num_batches,
             "loss_box_prior": total_box_prior / num_batches,
             "loss_contrast": total_contrast / num_batches,
+            "loss_joint_score": total_joint_score / num_batches,
             "num_pos": pred_scores.new_tensor(float(total_pos)),
             "num_neg": pred_scores.new_tensor(float(total_neg)),
             "mean_pos_score": (total_pos_score_sum / max(total_pos, 1)).detach(),
@@ -759,6 +796,7 @@ class PromptDetectionLoss(torch.nn.Module):
             + self.cfg.dfl_weight * one2many["loss_dfl"]
             + one2many["loss_box_prior"]
             + self.cfg.contrast_weight * one2many["loss_contrast"]
+            + self.cfg.joint_score_weight * one2many["loss_joint_score"]
         )
         loss_one2one = (
             self.cfg.objectness_weight * one2one["loss_objectness"]
@@ -769,6 +807,7 @@ class PromptDetectionLoss(torch.nn.Module):
             + self.cfg.dfl_weight * one2one["loss_dfl"]
             + one2one["loss_box_prior"]
             + self.cfg.contrast_weight * one2one["loss_contrast"]
+            + self.cfg.joint_score_weight * one2one["loss_joint_score"]
         )
         total_loss = (
             self.cfg.one2many_weight * loss_one2many
@@ -793,6 +832,7 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_dfl": one2one["loss_dfl"],
             "loss_box_prior": one2one["loss_box_prior"],
             "loss_contrast": one2one["loss_contrast"],
+            "loss_joint_score": one2one["loss_joint_score"],
             "loss_slot": grounding["loss_slot"],
             "loss_fg": grounding["loss_fg"],
             "loss_center": grounding["loss_center"],

@@ -292,6 +292,25 @@ class PromptDET(nn.Module):
             per_class_boxes = []
             per_class_scores = []
             per_class_labels = []
+            shared_center_scores = (pred_objectness[batch_idx] * pred_targetness[batch_idx]).clamp(min=0.0)
+            if local_peak_kernel > 1:
+                pad = local_peak_kernel // 2
+                level_keep = []
+                start = 0
+                for h, w in feature_shapes:
+                    count = h * w
+                    center_map = shared_center_scores[start:start + count].view(1, 1, h, w)
+                    peak_mask = F.max_pool2d(
+                        center_map,
+                        kernel_size=local_peak_kernel,
+                        stride=1,
+                        padding=pad,
+                    ).eq(center_map)
+                    level_keep.append(peak_mask.view(-1))
+                    start += count
+                shared_keep = torch.cat(level_keep, dim=0)
+            else:
+                shared_keep = torch.ones_like(shared_center_scores, dtype=torch.bool)
             for class_offset, label in enumerate(valid_class_ids):
                 class_logits = valid_logits[:, class_offset]
                 prompt_vs_null = (class_logits - pred_null_logits[batch_idx]).sigmoid()
@@ -306,26 +325,9 @@ class PromptDET(nn.Module):
                     valid_scores[:, class_offset]
                     * pred_objectness[batch_idx]
                     * pred_targetness[batch_idx]
-                ).clamp(min=0.0).pow(1.0 / 3.0)
+                ).clamp(min=0.0)
                 scores = base_scores * prompt_vs_null.square() * class_margin_gate
-                if local_peak_kernel > 1:
-                    pad = local_peak_kernel // 2
-                    level_keep = []
-                    start = 0
-                    for h, w in feature_shapes:
-                        count = h * w
-                        score_map = scores[start:start + count].view(1, 1, h, w)
-                        peak_mask = F.max_pool2d(
-                            score_map,
-                            kernel_size=local_peak_kernel,
-                            stride=1,
-                            padding=pad,
-                        ).eq(score_map)
-                        level_keep.append(peak_mask.view(-1))
-                        start += count
-                    keep = torch.cat(level_keep, dim=0)
-                else:
-                    keep = torch.ones_like(scores, dtype=torch.bool)
+                keep = shared_keep
                 class_boxes = boxes[keep]
                 class_scores_kept = scores[keep]
                 if class_scores_kept.numel() > pre_score_topk:
