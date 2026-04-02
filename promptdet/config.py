@@ -113,6 +113,8 @@ class LossConfig:
     duplicate_weight: float = 0.5
     non_target_weight: float = 1.0
     non_target_logit_margin: float = 0.0
+    prompt_null_margin: float = 0.35
+    prompt_null_weight: float = 0.5
     oversize_box_weight: float = 0.5
     oversize_box_threshold: float = 0.85
     oversize_box_topk: int = 16

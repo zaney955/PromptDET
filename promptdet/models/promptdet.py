@@ -294,13 +294,20 @@ class PromptDET(nn.Module):
             per_class_labels = []
             for class_offset, label in enumerate(valid_class_ids):
                 class_logits = valid_logits[:, class_offset]
-                prompt_vs_null = (0.5 * (class_logits - pred_null_logits[batch_idx])).sigmoid()
+                prompt_vs_null = (class_logits - pred_null_logits[batch_idx]).sigmoid()
+                if valid_logits.shape[1] > 1:
+                    class_selector = torch.zeros_like(valid_logits, dtype=torch.bool)
+                    class_selector[:, class_offset] = True
+                    competing_logits = valid_logits.masked_fill(class_selector, -1e4).max(dim=1).values
+                    class_margin_gate = (class_logits - competing_logits - 0.2).sigmoid()
+                else:
+                    class_margin_gate = torch.ones_like(prompt_vs_null)
                 base_scores = (
                     valid_scores[:, class_offset]
                     * pred_objectness[batch_idx]
                     * pred_targetness[batch_idx]
                 ).clamp(min=0.0).pow(1.0 / 3.0)
-                scores = base_scores * (0.25 + 0.75 * prompt_vs_null)
+                scores = base_scores * prompt_vs_null.square() * class_margin_gate
                 if local_peak_kernel > 1:
                     pad = local_peak_kernel // 2
                     level_keep = []

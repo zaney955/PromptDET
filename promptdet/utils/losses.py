@@ -443,13 +443,23 @@ class PromptDetectionLoss(torch.nn.Module):
             pred_obj = pred_objectness[batch_idx].sigmoid()
             pred_tgt = pred_targetness[batch_idx].sigmoid()
             null_terms = []
+            hard_neg_prompt_logits = None
+            hard_neg_null_logits = None
             if assign.fg_mask.any():
+                pos_labels = assign.matched_labels[assign.fg_mask]
+                pos_prompt_logits = valid_logits[assign.fg_mask].gather(1, pos_labels.unsqueeze(1)).squeeze(1)
+                pos_null_logits = pred_null_logits[batch_idx][assign.fg_mask]
                 null_terms.append(
                     F.binary_cross_entropy_with_logits(
-                        pred_null_logits[batch_idx][assign.fg_mask],
-                        torch.zeros_like(pred_null_logits[batch_idx][assign.fg_mask]),
+                        pos_null_logits,
+                        torch.zeros_like(pos_null_logits),
                         reduction="mean",
                     )
+                )
+                null_terms.append(
+                    self.cfg.prompt_null_weight * F.relu(
+                        self.cfg.prompt_null_margin - (pos_prompt_logits - pos_null_logits)
+                    ).mean()
                 )
             neg_mask = ~assign.fg_mask
             if neg_mask.any():
@@ -466,12 +476,19 @@ class PromptDetectionLoss(torch.nn.Module):
                 if hard_limit > 0:
                     hard_idx = torch.topk(neg_joint_scores, k=hard_limit).indices
                     hard_neg_logits = pred_null_logits[batch_idx][neg_mask][hard_idx]
+                    hard_neg_prompt_logits = valid_logits[neg_mask][hard_idx].max(dim=-1).values
+                    hard_neg_null_logits = hard_neg_logits
                     null_terms.append(
                         F.binary_cross_entropy_with_logits(
                             hard_neg_logits,
                             torch.ones_like(hard_neg_logits),
                             reduction="mean",
                         )
+                    )
+                    null_terms.append(
+                        self.cfg.prompt_null_weight * F.relu(
+                            self.cfg.prompt_null_margin + hard_neg_prompt_logits - hard_neg_null_logits
+                        ).mean()
                     )
             if null_terms:
                 total_null = total_null + torch.stack(null_terms).mean()
@@ -573,6 +590,14 @@ class PromptDetectionLoss(torch.nn.Module):
                     )
                     total_contrast = total_contrast + weighted_mean(
                         max_prompt_logit_margin_loss(non_target_scores, margin=self.cfg.non_target_logit_margin),
+                        region_weights,
+                    )
+                    non_target_prompt_logits = non_target_scores.max(dim=-1).values
+                    non_target_null_logits = pred_null_logits[batch_idx][non_target_mask]
+                    total_null = total_null + self.cfg.prompt_null_weight * weighted_mean(
+                        F.relu(
+                            self.cfg.prompt_null_margin + non_target_prompt_logits - non_target_null_logits
+                        ),
                         region_weights,
                     )
                 non_target_priors = pred_slot_priors[batch_idx][non_target_mask][:, valid_class_mask]

@@ -129,7 +129,14 @@ class PromptEpisodeDataset(Dataset):
     def _sample_prompt_classes(self, rng: random.Random) -> List[int]:
         max_classes = min(self.max_prompt_classes, len(self.classes))
         min_classes = min(self.min_prompt_classes, max_classes)
-        count = rng.randint(min_classes, max_classes)
+        if max_classes <= min_classes:
+            count = min_classes
+        else:
+            span = max_classes - min_classes
+            # Bias episodes toward smaller prompt sets so training remains
+            # genuinely prompt-conditioned instead of collapsing toward a
+            # near-closed-set detector when many classes exist.
+            count = min_classes + min(int((rng.random() ** 2) * (span + 1)), span)
         return rng.sample(self.classes, count)
 
     def _sample_prompt_instances(
@@ -197,6 +204,21 @@ class PromptEpisodeDataset(Dataset):
             candidates = [image_id for image_id in candidates if image_id not in prompt_image_set]
         if not candidates:
             return None
+        if len(prompt_class_set) > 1:
+            partial_candidates = [
+                image_id
+                for image_id in candidates
+                if 0 < len(self.image_to_class_ids[image_id] & prompt_class_set) < len(prompt_class_set)
+            ]
+            full_candidates = [
+                image_id
+                for image_id in candidates
+                if len(self.image_to_class_ids[image_id] & prompt_class_set) == len(prompt_class_set)
+            ]
+            if partial_candidates and (not full_candidates or rng.random() < 0.65):
+                candidates = partial_candidates
+            elif full_candidates:
+                candidates = full_candidates
         ranked = sorted(candidates, key=lambda image_id: self._score_positive_query(image_id, prompt_class_set), reverse=True)
         shortlist = ranked[: min(len(ranked), 3)]
         return rng.choice(shortlist)
