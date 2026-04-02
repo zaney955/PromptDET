@@ -159,8 +159,8 @@ class PromptDET(nn.Module):
         stride_parts = []
         prior_parts = []
         flat_box_logits = []
-        slot_memory = F.normalize(slot_memory, dim=-1)
-        null_memory = F.normalize(self.null_memory, dim=-1)
+        slot_memory = F.normalize(slot_memory, dim=-1, eps=1e-6)
+        null_memory = F.normalize(self.null_memory, dim=-1, eps=1e-6)
         null_parts = []
         for level_idx, (box_logit, objectness_logit, targetness_logit, class_embedding, stride) in enumerate(zip(
             box_logits,
@@ -181,7 +181,7 @@ class PromptDET(nn.Module):
             objectness_parts.append(flat_objectness)
             flat_targetness = targetness_logit.flatten(2).transpose(1, 2).squeeze(-1)
             targetness_parts.append(flat_targetness)
-            flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1)
+            flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
             level_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, slot_memory).max(dim=-1).values * logit_scale
             if slot_prior_maps:
                 flat_slot_prior = slot_prior_maps[level_idx].flatten(2).transpose(1, 2)
@@ -191,6 +191,7 @@ class PromptDET(nn.Module):
                     cls_prior.clamp(min=1e-4).log()
                     - bg_prior.clamp(min=1e-4).log()
                 ) * self.slot_prior_logit_scale * self.context_prior_strength
+                prior_bias = prior_bias.clamp(min=-6.0, max=6.0)
                 level_scores = level_scores + prior_bias
                 prior_parts.append(cls_prior)
             else:
@@ -288,48 +289,74 @@ class PromptDET(nn.Module):
                 })
                 continue
 
-            class_scores_max, class_index = valid_scores.max(dim=1)
-            class_logits_max = valid_logits.gather(1, class_index.unsqueeze(1)).squeeze(1)
-            prompt_vs_null = (0.5 * (class_logits_max - pred_null_logits[batch_idx])).sigmoid()
-            base_scores = (
-                class_scores_max
-                * pred_objectness[batch_idx]
-                * pred_targetness[batch_idx]
-            ).clamp(min=0.0).pow(1.0 / 3.0)
-            scores = base_scores * (0.25 + 0.75 * prompt_vs_null)
-            if local_peak_kernel > 1:
-                pad = local_peak_kernel // 2
-                level_keep = []
-                start = 0
-                for h, w in feature_shapes:
-                    count = h * w
-                    score_map = scores[start:start + count].view(1, 1, h, w)
-                    peak_mask = F.max_pool2d(
-                        score_map,
-                        kernel_size=local_peak_kernel,
-                        stride=1,
-                        padding=pad,
-                    ).eq(score_map)
-                    level_keep.append(peak_mask.view(-1))
-                    start += count
-                keep = torch.cat(level_keep, dim=0)
-            else:
-                keep = torch.ones_like(scores, dtype=torch.bool)
-            boxes = boxes[keep]
-            class_index = class_index[keep]
-            scores = scores[keep]
-            if scores.numel() > pre_score_topk:
-                topk_scores, topk_idx = torch.topk(scores, k=pre_score_topk)
-                boxes = boxes[topk_idx]
-                class_index = class_index[topk_idx]
-                scores = topk_scores
-            if boxes.numel() > 0:
-                size_penalty = oversize_box_penalty(boxes, image_size=image_size, area_threshold=oversize_box_threshold)
-                scores = scores * torch.exp(-oversize_box_gamma * size_penalty)
-            keep = scores > score_threshold
-            boxes = clamp_boxes(boxes[keep], image_size, image_size)
-            scores = scores[keep]
-            labels = valid_class_ids[class_index[keep]]
+            per_class_boxes = []
+            per_class_scores = []
+            per_class_labels = []
+            for class_offset, label in enumerate(valid_class_ids):
+                class_logits = valid_logits[:, class_offset]
+                prompt_vs_null = (0.5 * (class_logits - pred_null_logits[batch_idx])).sigmoid()
+                base_scores = (
+                    valid_scores[:, class_offset]
+                    * pred_objectness[batch_idx]
+                    * pred_targetness[batch_idx]
+                ).clamp(min=0.0).pow(1.0 / 3.0)
+                scores = base_scores * (0.25 + 0.75 * prompt_vs_null)
+                if local_peak_kernel > 1:
+                    pad = local_peak_kernel // 2
+                    level_keep = []
+                    start = 0
+                    for h, w in feature_shapes:
+                        count = h * w
+                        score_map = scores[start:start + count].view(1, 1, h, w)
+                        peak_mask = F.max_pool2d(
+                            score_map,
+                            kernel_size=local_peak_kernel,
+                            stride=1,
+                            padding=pad,
+                        ).eq(score_map)
+                        level_keep.append(peak_mask.view(-1))
+                        start += count
+                    keep = torch.cat(level_keep, dim=0)
+                else:
+                    keep = torch.ones_like(scores, dtype=torch.bool)
+                class_boxes = boxes[keep]
+                class_scores_kept = scores[keep]
+                if class_scores_kept.numel() > pre_score_topk:
+                    topk_scores, topk_idx = torch.topk(class_scores_kept, k=pre_score_topk)
+                    class_boxes = class_boxes[topk_idx]
+                    class_scores_kept = topk_scores
+                if class_boxes.numel() > 0:
+                    size_penalty = oversize_box_penalty(
+                        class_boxes,
+                        image_size=image_size,
+                        area_threshold=oversize_box_threshold,
+                    )
+                    class_scores_kept = class_scores_kept * torch.exp(-oversize_box_gamma * size_penalty)
+                keep = class_scores_kept > score_threshold
+                if keep.any():
+                    kept_boxes = clamp_boxes(class_boxes[keep], image_size, image_size)
+                    kept_scores = class_scores_kept[keep]
+                    kept_labels = torch.full(
+                        (int(kept_scores.shape[0]),),
+                        int(label.item()),
+                        dtype=class_ids.dtype,
+                        device=class_ids.device,
+                    )
+                    per_class_boxes.append(kept_boxes)
+                    per_class_scores.append(kept_scores)
+                    per_class_labels.append(kept_labels)
+
+            if not per_class_scores:
+                results.append({
+                    "boxes": boxes.new_zeros((0, 4)),
+                    "scores": boxes.new_zeros((0,)),
+                    "labels": class_ids.new_zeros((0,)),
+                })
+                continue
+
+            boxes = torch.cat(per_class_boxes, dim=0)
+            scores = torch.cat(per_class_scores, dim=0)
+            labels = torch.cat(per_class_labels, dim=0)
             order = scores.argsort(descending=True)[:max_detections]
             results.append({
                 "boxes": boxes[order],

@@ -111,10 +111,25 @@ class PromptContextPainter(nn.Module):
                 flat_mask[batch_idx, torch.randint(flat_mask.shape[1], (1,), device=device)] = 1.0
         return flat_mask.view(batch_size, 1, height, width)
 
+    def _classwise_reduce_and_broadcast(
+        self,
+        tokens: torch.Tensor,
+        prompt_class_indices: torch.Tensor,
+        prompt_instance_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        safe_indices = prompt_class_indices.clamp(min=0, max=self.max_prompt_classes - 1)
+        class_assign = F.one_hot(safe_indices, num_classes=self.max_prompt_classes).float()
+        class_assign = class_assign * prompt_instance_mask.unsqueeze(-1).float()
+        class_counts = class_assign.sum(dim=1).clamp(min=1.0)
+        class_tokens = torch.einsum("bpk,bpsd->bksd", class_assign, tokens) / class_counts.unsqueeze(-1).unsqueeze(-1)
+        broadcast_tokens = torch.einsum("bpk,bksd->bpsd", class_assign, class_tokens)
+        return class_tokens, broadcast_tokens
+
     def forward(
         self,
         prompt_feat: torch.Tensor,
         prompt_target_maps: torch.Tensor,
+        prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         query_feat: torch.Tensor,
         query_target_maps: torch.Tensor | None,
@@ -188,17 +203,36 @@ class PromptContextPainter(nn.Module):
             tokens = tokens.reshape(batch_size, num_instances, 4 * seq_len, self.dim) * pair_mask
             if layer_idx >= self.feature_ensemble_start:
                 prompt_img_seq, query_img_seq, prompt_tgt_seq, query_tgt_seq = torch.split(tokens, seq_len, dim=2)
-                denom = prompt_instance_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0).view(batch_size, 1, 1, 1)
-                avg_query_img = (query_img_seq * pair_mask).sum(dim=1, keepdim=True) / denom
-                avg_query_tgt = (query_tgt_seq * pair_mask).sum(dim=1, keepdim=True) / denom
-                query_img_seq = avg_query_img.expand_as(query_img_seq)
-                query_tgt_seq = avg_query_tgt.expand_as(query_tgt_seq)
+                _, query_img_seq = self._classwise_reduce_and_broadcast(
+                    query_img_seq,
+                    prompt_class_indices,
+                    prompt_instance_mask,
+                )
+                _, query_tgt_seq = self._classwise_reduce_and_broadcast(
+                    query_tgt_seq,
+                    prompt_class_indices,
+                    prompt_instance_mask,
+                )
                 tokens = torch.cat([prompt_img_seq, query_img_seq, prompt_tgt_seq, query_tgt_seq], dim=2)
 
         prompt_img_seq, query_img_seq, prompt_tgt_seq, query_tgt_seq = torch.split(tokens, seq_len, dim=2)
-        denom = prompt_instance_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0).view(batch_size, 1, 1)
-        query_img_seq = (query_img_seq * pair_mask).sum(dim=1) / denom
-        query_tgt_seq = (query_tgt_seq * pair_mask).sum(dim=1) / denom
+        class_query_img_seq, _ = self._classwise_reduce_and_broadcast(
+            query_img_seq,
+            prompt_class_indices,
+            prompt_instance_mask,
+        )
+        class_query_tgt_seq, _ = self._classwise_reduce_and_broadcast(
+            query_tgt_seq,
+            prompt_class_indices,
+            prompt_instance_mask,
+        )
+        class_mask = (
+            F.one_hot(prompt_class_indices.clamp(min=0, max=self.max_prompt_classes - 1), num_classes=self.max_prompt_classes).float()
+            * prompt_instance_mask.unsqueeze(-1).float()
+        ).sum(dim=1).gt(0).float()
+        class_denom = class_mask.sum(dim=1, keepdim=True).clamp(min=1.0).unsqueeze(-1)
+        query_img_seq = (class_query_img_seq * class_mask.unsqueeze(-1).unsqueeze(-1)).sum(dim=1) / class_denom
+        query_tgt_seq = (class_query_tgt_seq * class_mask.unsqueeze(-1).unsqueeze(-1)).sum(dim=1) / class_denom
         query_img_latent = query_img_seq.transpose(1, 2).reshape(batch_size, self.dim, height, width)
         query_tgt_latent = query_tgt_seq.transpose(1, 2).reshape(batch_size, self.dim, height, width)
         query_latent = torch.cat([query_img_latent, query_tgt_latent], dim=1)

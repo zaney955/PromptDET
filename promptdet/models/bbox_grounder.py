@@ -158,6 +158,7 @@ class BBoxPromptGrounder(nn.Module):
         painter_outputs = self.painter(
             prompt_feat,
             prompt_target_maps,
+            prompt_class_indices,
             prompt_instance_mask,
             query_feats[self.scale],
             query_target_maps,

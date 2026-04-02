@@ -63,7 +63,10 @@ def main():
     ):
         raise ValueError("train/val txt lists, label dirs, and class_names_path must be provided.")
     if config.data.max_prompt_classes > config.model.max_prompt_classes:
-        raise ValueError("data.max_prompt_classes cannot exceed model.max_prompt_classes.")
+        raise ValueError(
+            "data.max_prompt_classes cannot exceed model.max_prompt_classes "
+            f"(got data={config.data.max_prompt_classes}, model={config.model.max_prompt_classes})."
+        )
 
     dist_info = setup_distributed(config.train.device, local_rank=args.local_rank)
     device = dist_info["device"]

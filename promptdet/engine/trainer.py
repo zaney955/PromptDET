@@ -66,7 +66,9 @@ def train(
     model.to(device)
     model_without_ddp = unwrap_model(model)
     loss_fn.to(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=config.train.mixed_precision and device.type == "cuda")
+    amp_enabled = config.train.mixed_precision and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
     scheduler = _make_scheduler(optimizer, config.train.epochs, config.train.warmup_epochs)
     start_epoch = 0
     best_f1 = 0.0
@@ -127,7 +129,7 @@ def train(
 
             optimizer.zero_grad(set_to_none=True)
             amp_context = (
-                torch.amp.autocast(device_type="cuda", enabled=scaler.is_enabled())
+                torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled)
                 if device.type == "cuda"
                 else nullcontext()
             )
@@ -147,12 +149,23 @@ def train(
                 losses = loss_fn(decoded, targets)
                 loss = losses["loss"]
 
-            scaler.scale(loss).backward()
-            if config.train.grad_clip > 0:
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite loss detected at epoch={epoch}, step={num_steps}.")
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip) if config.train.grad_clip > 0 else None
+                if grad_norm is not None and not torch.isfinite(grad_norm):
+                    raise FloatingPointError(f"Non-finite gradient norm detected at epoch={epoch}, step={num_steps}.")
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip) if config.train.grad_clip > 0 else None
+                if grad_norm is not None and not torch.isfinite(grad_norm):
+                    raise FloatingPointError(f"Non-finite gradient norm detected at epoch={epoch}, step={num_steps}.")
+                optimizer.step()
 
             for key in epoch_stats:
                 epoch_stats[key] += float(losses[key].item())

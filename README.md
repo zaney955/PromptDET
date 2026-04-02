@@ -206,7 +206,8 @@ Inference uses the `one2one` branch only.
 The intended prediction path is:
 
 - decode `one2one`
-- apply local peak filtering on center logits
+- run prompt-defined classes through independent class-conditional search branches
+- apply local peak filtering within each active prompt class
 - combine center-aware objectness, prompt-class confidence, and quality confidence into a score
 - apply size-aware suppression to near-full-image false boxes before thresholding
 - threshold
