@@ -59,6 +59,27 @@ class PromptDET(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(cfg.logit_scale_init))
         self.context_prior_strength = 1.0
         self.slot_prior_logit_scale = nn.Parameter(torch.tensor(1.0))
+        self._register_ddp_grad_layout_hooks()
+
+    def _register_ddp_grad_layout_hooks(self) -> None:
+        # Some conv weights fed by heavy reshape/permute paths can produce
+        # non-standard grad strides under DDP, which triggers reducer warnings
+        # and slows bucket reduction. Normalize grads before DDP sees them.
+        def _make_hook():
+            def _hook(grad: torch.Tensor) -> torch.Tensor:
+                if grad.dim() == 4:
+                    expected_stride = torch.empty_like(
+                        grad,
+                        memory_format=torch.contiguous_format,
+                    ).stride()
+                    if grad.stride() != expected_stride:
+                        return grad.clone(memory_format=torch.contiguous_format)
+                return grad if grad.is_contiguous() else grad.contiguous()
+            return _hook
+
+        for parameter in self.parameters():
+            if parameter.requires_grad and parameter.dim() >= 2:
+                parameter.register_hook(_make_hook())
 
     def set_context_prior_strength(self, strength: float) -> None:
         self.context_prior_strength = float(strength)

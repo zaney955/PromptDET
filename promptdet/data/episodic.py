@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import cv2
 import numpy as np
-from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
@@ -17,23 +17,25 @@ from promptdet.data.prompt_hints import (
     build_query_detection_targets,
     sample_slot_colors,
 )
-from promptdet.data.yolo_io import load_image_list, parse_yolo_label_file
+from promptdet.data.yolo_io import imread_rgb, load_image_list, parse_yolo_label_file, probe_image_size
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 
+DEFAULT_IMAGE_CACHE_SIZE = 128
 
-def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
-    array = np.asarray(image, dtype=np.float32) / 255.0
+
+def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
+    array = image.astype(np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1)
 
 
-def resize_image_and_boxes(image: Image.Image, boxes: torch.Tensor, size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    orig_w, orig_h = image.size
-    resized = image.resize((size, size), Image.Resampling.BILINEAR)
+def resize_image_and_boxes(image: np.ndarray, boxes: torch.Tensor, size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    orig_h, orig_w = image.shape[:2]
+    resized = cv2.resize(image, (size, size), interpolation=cv2.INTER_LINEAR)
     boxes = boxes.clone().float()
     if boxes.numel() > 0:
         boxes[:, 0::2] *= size / orig_w
         boxes[:, 1::2] *= size / orig_h
-    return _pil_to_tensor(resized), boxes
+    return _numpy_to_tensor(resized), boxes
 
 
 def _yolo_box_valid(box: list[float]) -> bool:
@@ -81,6 +83,8 @@ class PromptEpisodeDataset(Dataset):
         self.positive_query_shortlist = positive_query_shortlist
         self.seed = seed
         self.label_paths_by_stem = {}
+        self.image_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self.image_cache_size = DEFAULT_IMAGE_CACHE_SIZE
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -93,8 +97,7 @@ class PromptEpisodeDataset(Dataset):
             self.label_paths_by_stem[label_path.stem] = label_path
         ann_id = 0
         for image_id, image_path in enumerate(load_image_list(image_list_path)):
-            with Image.open(image_path) as image:
-                image_w, image_h = image.size
+            image_w, image_h = probe_image_size(image_path)
             self.image_records[image_id] = {
                 "id": image_id,
                 "file_name": image_path.name,
@@ -130,9 +133,18 @@ class PromptEpisodeDataset(Dataset):
     def __len__(self) -> int:
         return self.episodes_per_epoch
 
-    def _load_image(self, image_id: int) -> Image.Image:
+    def _load_image(self, image_id: int) -> np.ndarray:
+        cached = self.image_cache.get(image_id)
+        if cached is not None:
+            self.image_cache.move_to_end(image_id)
+            return cached
         path = Path(self.image_records[image_id]["path"])
-        return Image.open(path).convert("RGB")
+        image = imread_rgb(path)
+        self.image_cache[image_id] = image
+        self.image_cache.move_to_end(image_id)
+        if len(self.image_cache) > self.image_cache_size:
+            self.image_cache.popitem(last=False)
+        return image
 
     def _sample_prompt_classes(self, rng: random.Random) -> List[int]:
         max_classes = min(self.max_prompt_classes, len(self.classes))

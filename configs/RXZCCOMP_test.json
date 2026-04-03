@@ -56,7 +56,7 @@
     "num_workers": 2
   },
   "train": {
-    "output_dir": "./outputs/RXZCCOMP_test",
+    "output_dir": "./outputs/RXZCCOMP_test/exp1",
     "device": "cuda",
     "batch_size": 8,
     "epochs": 100,
