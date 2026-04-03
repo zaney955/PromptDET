@@ -66,6 +66,8 @@ class DataConfig:
     max_prompt_instances_per_class: int = 2
     max_prompt_images: int = 4
     negative_episode_ratio: float = 0.5
+    hard_positive_ratio: float = 0.5
+    positive_query_shortlist: int = 6
     episodes_per_epoch: int = 2000
     val_episodes: int = 300
     num_workers: int = 2

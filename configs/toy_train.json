@@ -49,6 +49,8 @@
     "max_prompt_instances_per_class": 2,
     "max_prompt_images": 4,
     "negative_episode_ratio": 0.6,
+    "hard_positive_ratio": 0.5,
+    "positive_query_shortlist": 6,
     "episodes_per_epoch": 1000,
     "val_episodes": 200,
     "num_workers": 2

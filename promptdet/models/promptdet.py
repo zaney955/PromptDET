@@ -146,6 +146,7 @@ class PromptDET(nn.Module):
         logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         for branch in branches.values():
             branch["slot_memory"] = slot_memory
+            branch["class_prototypes"] = prompt_encoding["class_prototypes"]
             branch["class_mask"] = grounding["class_mask"]
             branch["logit_scale"] = logit_scale
         branches["context_aux"] = {
@@ -168,6 +169,7 @@ class PromptDET(nn.Module):
         class_embeddings = outputs["class_embeddings"]
         slot_prior_maps = outputs.get("slot_prior_maps", [])
         slot_memory = outputs["slot_memory"]
+        class_prototypes = outputs["class_prototypes"]
         class_mask = outputs["class_mask"]
         logit_scale = outputs["logit_scale"]
 
@@ -184,8 +186,11 @@ class PromptDET(nn.Module):
         prior_parts = []
         flat_box_logits = []
         slot_memory = F.normalize(slot_memory, dim=-1, eps=1e-6)
+        class_prototypes = F.normalize(class_prototypes, dim=-1, eps=1e-6)
         null_memory = F.normalize(self.null_memory, dim=-1, eps=1e-6)
         null_parts = []
+        detail_weight = float(self.cfg.detail_score_weight)
+        detail_weight = min(max(detail_weight, 0.0), 1.0)
         for level_idx, (box_logit, objectness_logit, targetness_logit, class_embedding, stride) in enumerate(zip(
             box_logits,
             objectness_logits,
@@ -206,7 +211,9 @@ class PromptDET(nn.Module):
             flat_targetness = targetness_logit.flatten(2).transpose(1, 2).squeeze(-1)
             targetness_parts.append(flat_targetness)
             flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
-            level_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, slot_memory).max(dim=-1).values * logit_scale
+            detail_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, slot_memory).max(dim=-1).values
+            prototype_scores = torch.einsum("bnd,bkd->bnk", flat_embeddings, class_prototypes)
+            level_scores = (detail_weight * detail_scores + (1.0 - detail_weight) * prototype_scores) * logit_scale
             if slot_prior_maps:
                 flat_slot_prior = slot_prior_maps[level_idx].flatten(2).transpose(1, 2)
                 cls_prior = flat_slot_prior[:, :, 1:]

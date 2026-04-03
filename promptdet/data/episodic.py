@@ -59,6 +59,8 @@ class PromptEpisodeDataset(Dataset):
         center_target_sigma: float = 0.35,
         hint_inner_shrink: float = 0.6,
         hint_bg_expand: float = 0.12,
+        hard_positive_ratio: float = 0.5,
+        positive_query_shortlist: int = 6,
         seed: int | None = None,
     ):
         super().__init__()
@@ -74,6 +76,8 @@ class PromptEpisodeDataset(Dataset):
         self.center_target_sigma = center_target_sigma
         self.hint_inner_shrink = hint_inner_shrink
         self.hint_bg_expand = hint_bg_expand
+        self.hard_positive_ratio = hard_positive_ratio
+        self.positive_query_shortlist = positive_query_shortlist
         self.seed = seed
 
         self.image_records: Dict[int, dict] = {}
@@ -219,9 +223,35 @@ class PromptEpisodeDataset(Dataset):
                 candidates = partial_candidates
             elif full_candidates:
                 candidates = full_candidates
-        ranked = sorted(candidates, key=lambda image_id: self._score_positive_query(image_id, prompt_class_set), reverse=True)
-        shortlist = ranked[: min(len(ranked), 3)]
-        return rng.choice(shortlist)
+        ranked = sorted(
+            candidates,
+            key=lambda image_id: self._score_positive_query(image_id, prompt_class_set),
+            reverse=True,
+        )
+        shortlist_size = min(len(ranked), max(int(self.positive_query_shortlist), 1))
+        shortlist = ranked[:shortlist_size]
+        if len(shortlist) == 1:
+            return shortlist[0]
+
+        scored_shortlist = [
+            (
+                image_id,
+                self._score_positive_query(image_id, prompt_class_set),
+            )
+            for image_id in shortlist
+        ]
+        hard_candidates = [item for item in scored_shortlist if item[1][2] < 0]
+        if hard_candidates and rng.random() < self.hard_positive_ratio:
+            max_unrelated = max(-score[2] for _, score in hard_candidates)
+            choice_pool = [
+                image_id
+                for image_id, score in hard_candidates
+                if -score[2] == max_unrelated
+            ]
+            return rng.choice(choice_pool)
+
+        easy_pool = shortlist[: min(len(shortlist), 3)]
+        return rng.choice(easy_pool)
 
     def _select_negative_query(
         self,

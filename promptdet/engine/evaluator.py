@@ -67,17 +67,25 @@ def evaluate(
                     pred["labels"].cpu(),
                     target["boxes"].cpu(),
                     target["category_ids"].cpu(),
+                    target["non_target_boxes"].cpu(),
                 )
             )
 
     metrics = aggregate_metrics(items)
     metric_tensor = torch.tensor(
-        [metrics.tp, metrics.fp, metrics.fn],
+        [
+            metrics.tp,
+            metrics.fp,
+            metrics.fn,
+            metrics.fp_on_non_target_object,
+            metrics.fp_near_prompt_target,
+            metrics.fp_background,
+        ],
         dtype=torch.float32,
         device=device,
     )
     metric_tensor = reduce_tensor(metric_tensor, average=False)
-    tp, fp, fn = [float(x) for x in metric_tensor.tolist()]
+    tp, fp, fn, fp_on_non_target_object, fp_near_prompt_target, fp_background = [float(x) for x in metric_tensor.tolist()]
     precision = tp / max(tp + fp, 1.0)
     recall = tp / max(tp + fn, 1.0)
     f1 = 2 * precision * recall / max(precision + recall, 1e-6)
@@ -88,4 +96,7 @@ def evaluate(
         "true_positives": tp,
         "false_positives": fp,
         "false_negatives": fn,
+        "false_positives_on_non_target_object": fp_on_non_target_object,
+        "false_positives_near_prompt_target": fp_near_prompt_target,
+        "false_positives_background": fp_background,
     }

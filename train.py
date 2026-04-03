@@ -96,6 +96,8 @@ def main():
         center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
+        hard_positive_ratio=config.data.hard_positive_ratio,
+        positive_query_shortlist=config.data.positive_query_shortlist,
         seed=None,
     )
     val_dataset = PromptEpisodeDataset(
@@ -113,6 +115,8 @@ def main():
         center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
+        hard_positive_ratio=config.data.hard_positive_ratio,
+        positive_query_shortlist=config.data.positive_query_shortlist,
         seed=config.train.seed + 100_000,
     )
 
