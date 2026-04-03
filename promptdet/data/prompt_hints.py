@@ -7,6 +7,8 @@ import numpy as np
 from PIL import Image
 import torch
 
+PROMPT_TARGET_CHANNELS = 5
+
 
 def _clamp_box(box: torch.Tensor, image_size: int) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = box.tolist()
@@ -85,7 +87,7 @@ def build_prompt_target_map(
     slot_colors: torch.Tensor,
     center_sigma: float,
 ) -> torch.Tensor:
-    target = torch.zeros((5, image_size, image_size), dtype=torch.float32)
+    target = torch.zeros((PROMPT_TARGET_CHANNELS, image_size, image_size), dtype=torch.float32)
     left, top, right, bottom = _clamp_box(box, image_size)
     box_mask = torch.zeros((image_size, image_size), dtype=torch.float32)
     box_mask[top:bottom, left:right] = 1.0
@@ -103,7 +105,7 @@ def build_target_map_from_dense_targets(
     slot_colors: torch.Tensor,
 ) -> torch.Tensor:
     height, width = slot_target.shape[-2:]
-    target = torch.zeros((5, height, width), dtype=torch.float32)
+    target = torch.zeros((PROMPT_TARGET_CHANNELS, height, width), dtype=torch.float32)
     for slot_idx in range(slot_colors.shape[0]):
         mask = slot_target == (slot_idx + 1)
         if mask.any():

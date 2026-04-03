@@ -11,12 +11,13 @@ import torch
 from torch.utils.data import Dataset
 
 from promptdet.data.prompt_hints import (
+    PROMPT_TARGET_CHANNELS,
     build_prompt_hint_map,
     build_prompt_target_map,
     build_query_detection_targets,
     sample_slot_colors,
 )
-from promptdet.data.yolo_io import load_class_names, load_image_list, parse_yolo_label_file
+from promptdet.data.yolo_io import load_image_list, parse_yolo_label_file
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 
 
@@ -47,7 +48,7 @@ class PromptEpisodeDataset(Dataset):
         self,
         image_list_path: str,
         labels_dir: str,
-        class_names_path: str,
+        class_names: Dict[str, str] | Dict[int, str],
         image_size: int,
         episodes_per_epoch: int,
         negative_episode_ratio: float = 0.2,
@@ -79,6 +80,7 @@ class PromptEpisodeDataset(Dataset):
         self.hard_positive_ratio = hard_positive_ratio
         self.positive_query_shortlist = positive_query_shortlist
         self.seed = seed
+        self.label_paths_by_stem = {}
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -86,7 +88,9 @@ class PromptEpisodeDataset(Dataset):
         self.class_to_anns: Dict[int, List[dict]] = defaultdict(list)
         self.class_to_image_ids: Dict[int, set[int]] = defaultdict(set)
         self.class_image_to_anns: Dict[int, Dict[int, List[dict]]] = defaultdict(lambda: defaultdict(list))
-        self.categories = load_class_names(class_names_path)
+        self.categories = {int(idx): name for idx, name in class_names.items()}
+        for label_path in self.labels_dir.rglob("*.txt"):
+            self.label_paths_by_stem[label_path.stem] = label_path
         ann_id = 0
         for image_id, image_path in enumerate(load_image_list(image_list_path)):
             with Image.open(image_path) as image:
@@ -98,7 +102,7 @@ class PromptEpisodeDataset(Dataset):
                 "width": image_w,
                 "height": image_h,
             }
-            label_path = self.labels_dir / f"{image_path.stem}.txt"
+            label_path = self.label_paths_by_stem.get(image_path.stem, self.labels_dir / f"{image_path.stem}.txt")
             for category_id, bbox in parse_yolo_label_file(label_path):
                 if category_id not in self.categories or not _yolo_box_valid(bbox):
                     continue
@@ -414,12 +418,13 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
     max_prompt_instances = max(item["prompt_images"].shape[0] for item in batch)
     max_prompt_classes = max(item["prompt_class_ids"].shape[0] for item in batch)
     channels, height, width = batch[0]["query_image"].shape
-    target_channels = batch[0]["prompt_target_maps"].shape[1]
-
     prompt_images = torch.zeros((batch_size, max_prompt_instances, channels, height, width), dtype=torch.float32)
     prompt_boxes = torch.zeros((batch_size, max_prompt_instances, 4), dtype=torch.float32)
     prompt_hint_maps = torch.zeros((batch_size, max_prompt_instances, 3, height, width), dtype=torch.float32)
-    prompt_target_maps = torch.zeros((batch_size, max_prompt_instances, target_channels, height, width), dtype=torch.float32)
+    prompt_target_maps = torch.zeros(
+        (batch_size, max_prompt_instances, PROMPT_TARGET_CHANNELS, height, width),
+        dtype=torch.float32,
+    )
     prompt_class_indices = torch.zeros((batch_size, max_prompt_instances), dtype=torch.long)
     prompt_instance_mask = torch.zeros((batch_size, max_prompt_instances), dtype=torch.bool)
     prompt_class_ids = torch.full((batch_size, max_prompt_classes), -1, dtype=torch.long)

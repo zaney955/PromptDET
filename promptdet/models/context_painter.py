@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from promptdet.config import DenseGroundingConfig
+from promptdet.data.prompt_hints import PROMPT_TARGET_CHANNELS
 
 from .common import ConvBNAct, MLP
 
@@ -41,7 +42,7 @@ class PromptContextPainter(nn.Module):
         self.dim = cfg.dim
         self.feature_ensemble_start = min(max(int(cfg.feature_ensemble_start), 0), max(int(cfg.depth) - 1, 0))
         self.query_mask_ratio = float(cfg.query_mask_ratio)
-        self.target_channels = int(cfg.target_channels)
+        self.target_channels = PROMPT_TARGET_CHANNELS
 
         hidden = max(cfg.dim // 2, 32)
         self.image_proj = nn.Conv2d(in_channels, cfg.dim, 1)

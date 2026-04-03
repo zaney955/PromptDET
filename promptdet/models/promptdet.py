@@ -36,7 +36,7 @@ class PromptDET(nn.Module):
     def __init__(self, cfg: ModelConfig, context_cfg: DenseGroundingConfig | None = None):
         super().__init__()
         self.cfg = cfg
-        self.context_cfg = context_cfg or DenseGroundingConfig(enabled=False)
+        self.context_cfg = context_cfg or DenseGroundingConfig()
         self.backbone = PromptDetBackbone(cfg.backbone_widths)
         self.neck = PromptDetNeck(self.backbone.out_channels, cfg.neck_channels)
         self.prompt_encoder = PromptEncoder(

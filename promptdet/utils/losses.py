@@ -409,7 +409,7 @@ class PromptDetectionLoss(torch.nn.Module):
         super().__init__()
         self.reg_max = reg_max
         self.cfg = cfg
-        self.context_cfg = context_cfg or DenseGroundingConfig(enabled=False)
+        self.context_cfg = context_cfg or DenseGroundingConfig()
         self.one2many_assigner = PromptTaskAlignedAssigner(
             cfg.tal_topk,
             cfg.tal_alpha,

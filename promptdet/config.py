@@ -9,15 +9,12 @@ from typing import Any, Dict, List
 @dataclass
 class ModelConfig:
     image_size: int = 256
-    num_classes: int = 8
     max_prompt_classes: int = 4
     backbone_widths: List[int] = field(default_factory=lambda: [48, 96, 192, 384])
     neck_channels: int = 192
     prompt_dim: int = 256
     reg_max: int = 16
     num_attention_heads: int = 8
-    grounding_dim: int = 192
-    grounding_depth: int = 4
     prompt_crop_size: int = 128
     label_dropout: float = 0.4
     logit_scale_init: float = 1.5
@@ -26,7 +23,6 @@ class ModelConfig:
 
 @dataclass
 class DenseGroundingConfig:
-    enabled: bool = True
     scale: str = "p3"
     dim: int = 256
     depth: int = 4
@@ -35,7 +31,6 @@ class DenseGroundingConfig:
     recon_decoder_dim: int = 64
     query_mask_ratio: float = 1.0
     canvas_loss_weight: float = 1.0
-    prior_weight: float = 1.0
     prior_warmup_ratio: float = 0.1
     random_color_min_distance: float = 0.45
     hint_inner_shrink: float = 0.6
@@ -46,7 +41,6 @@ class DenseGroundingConfig:
     fg_dice_weight: float = 1.0
     center_loss_weight: float = 1.0
     prior_consistency_weight: float = 0.5
-    target_channels: int = 5
 
 
 ContextPainterConfig = DenseGroundingConfig
@@ -56,9 +50,8 @@ ContextPainterConfig = DenseGroundingConfig
 class DataConfig:
     train_list: str = ""
     val_list: str = ""
-    train_labels_dir: str = ""
-    val_labels_dir: str = ""
-    class_names_path: str = ""
+    labels_dir: str = ""
+    class_names: Dict[str, str] = field(default_factory=dict)
     min_prompt_classes: int = 1
     max_prompt_classes: int = 3
     max_prompt_instances_per_class: int = 2
@@ -135,11 +128,6 @@ class PromptDetConfig:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-    @property
-    def context_painter(self) -> DenseGroundingConfig:
-        return self.dense_grounding
-
-
 def _update_dataclass(instance: Any, payload: Dict[str, Any]) -> Any:
     for key, value in payload.items():
         if not hasattr(instance, key):
@@ -157,25 +145,6 @@ def load_config(path: str | Path | None) -> PromptDetConfig:
     if path is None:
         return config
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if "context_painter" in data and "dense_grounding" not in data:
-        data["dense_grounding"] = data.pop("context_painter")
-    if "data" in data:
-        data["data"] = dict(data["data"])
-        if "negative_ratio" in data["data"] and "negative_episode_ratio" not in data["data"]:
-            data["data"]["negative_episode_ratio"] = data["data"].pop("negative_ratio")
-    if "train" in data:
-        data["train"] = dict(data["train"])
-        legacy_train_keys = {
-            "conf_threshold": "score_threshold",
-            "pre_nms_topk": "pre_score_topk",
-            "one2one_peak_kernel": "local_peak_kernel",
-            "max_det": "max_detections",
-        }
-        for old_key, new_key in legacy_train_keys.items():
-            if old_key in data["train"] and new_key not in data["train"]:
-                data["train"][new_key] = data["train"].pop(old_key)
-        data["train"].pop("nms_iou_threshold", None)
-        data["train"].pop("one2one_topk", None)
     return _update_dataclass(config, data)
 
 
