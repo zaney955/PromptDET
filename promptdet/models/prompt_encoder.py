@@ -71,7 +71,6 @@ class PromptEncoder(nn.Module):
             ConvBNAct(192, out_channels, 3, stride=2),
         )
         self.local_proj = nn.Conv2d(out_channels, out_channels, 1)
-        self.detail_proj = nn.Linear(out_channels, prompt_dim)
         self.global_proj = nn.Linear(out_channels * 2 + 4, prompt_dim)
         self.class_slot_embed = nn.Embedding(max_prompt_classes, prompt_dim)
         self.local_slot_proj = nn.Linear(prompt_dim, out_channels)
@@ -153,9 +152,6 @@ class PromptEncoder(nn.Module):
         padded_class_mask[:, :prompt_class_mask.shape[1]] = prompt_class_mask
         class_prototypes = class_prototypes * padded_class_mask.unsqueeze(-1)
         class_local_tokens = class_local_tokens * padded_class_mask.unsqueeze(-1).unsqueeze(-1)
-        class_detail_tokens = self.detail_proj(class_local_tokens)
-        class_detail_tokens = class_detail_tokens * padded_class_mask.unsqueeze(-1).unsqueeze(-1)
-
         class_memory_mask = padded_class_mask.unsqueeze(-1).expand(batch_size, self.max_prompt_classes, token_count)
         class_memory_tokens = class_local_tokens.reshape(batch_size, self.max_prompt_classes * token_count, -1)
         class_memory_mask = class_memory_mask.reshape(batch_size, self.max_prompt_classes * token_count)
@@ -178,7 +174,6 @@ class PromptEncoder(nn.Module):
             "memory_tokens": memory_tokens,
             "memory_mask": memory_mask,
             "class_prototypes": class_prototypes,
-            "class_detail_tokens": class_detail_tokens,
             "class_mask": padded_class_mask,
             "scale_tokens": scale_tokens,
             "instance_prototypes": instance_global,

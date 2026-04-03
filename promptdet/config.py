@@ -22,7 +22,6 @@ class ModelConfig:
     label_dropout: float = 0.4
     logit_scale_init: float = 1.5
     max_logit_scale: float = 2.5
-    detail_score_weight: float = 0.5
 
 
 @dataclass
@@ -33,7 +32,6 @@ class DenseGroundingConfig:
     depth: int = 4
     num_heads: int = 8
     feature_ensemble_start: int = 2
-    slot_memory_tokens: int = 4
     recon_decoder_dim: int = 64
     query_mask_ratio: float = 1.0
     canvas_loss_weight: float = 1.0
@@ -108,16 +106,12 @@ class LossConfig:
     non_target_center_sampling_radius: float = 0.75
     objectness_weight: float = 1.0
     targetness_weight: float = 1.0
-    null_weight: float = 0.5
     match_weight: float = 1.0
     iou_weight: float = 7.5
     dfl_weight: float = 1.5
     duplicate_weight: float = 0.5
     non_target_weight: float = 1.0
     non_target_logit_margin: float = 0.0
-    prompt_null_margin: float = 0.35
-    prompt_null_weight: float = 0.5
-    joint_score_weight: float = 0.75
     oversize_box_weight: float = 0.5
     oversize_box_threshold: float = 0.85
     oversize_box_topk: int = 16
@@ -126,8 +120,6 @@ class LossConfig:
     focal_gamma: float = 2.0
     classification_margin: float = 0.2
     center_target_sigma: float = 0.35
-    null_neg_pos_ratio: float = 16.0
-    null_min_negatives: int = 32
     one2many_weight: float = 1.0
     one2one_weight: float = 1.5
 

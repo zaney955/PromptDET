@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Dict, List
 
 import torch
@@ -37,16 +36,6 @@ def sigmoid_varifocal_loss(
     if reduction == "mean":
         return loss.mean()
     return loss
-
-
-def safe_prob_bce(
-    prob: torch.Tensor,
-    targets: torch.Tensor,
-    reduction: str = "mean",
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    logits = torch.logit(prob.clamp(min=eps, max=1.0 - eps))
-    return F.binary_cross_entropy_with_logits(logits, targets, reduction=reduction)
 
 
 def weighted_mean(loss: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -117,12 +106,6 @@ def build_center_heat_targets(
     return targets.clamp(0.0, 1.0)
 
 
-def max_prompt_logit_margin_loss(logits: torch.Tensor, margin: float) -> torch.Tensor:
-    if logits.numel() == 0:
-        return logits.new_tensor(0.0)
-    return F.relu(logits.max(dim=-1).values - margin)
-
-
 def oversize_box_penalty(boxes: torch.Tensor, image_size: int, area_threshold: float) -> torch.Tensor:
     x1 = boxes[:, 0].clamp(0.0, float(image_size))
     y1 = boxes[:, 1].clamp(0.0, float(image_size))
@@ -138,6 +121,80 @@ def oversize_box_penalty(boxes: torch.Tensor, image_size: int, area_threshold: f
         + (y2 >= image_size - 1.0).float()
     ) / 4.0
     return (area_ratio - area_threshold).clamp(min=0.0) * (1.0 + edge_touch)
+
+
+def build_class_region_targets(
+    anchor_points: torch.Tensor,
+    boxes: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int,
+    center_sampling_radius: float,
+    valid_class_mask: torch.Tensor,
+) -> torch.Tensor:
+    targets = anchor_points.new_zeros((anchor_points.shape[0], num_classes))
+    if boxes.numel() == 0:
+        return targets
+    unit_weights = boxes.new_ones((boxes.shape[0],))
+    for class_idx in range(num_classes):
+        if not valid_class_mask[class_idx]:
+            continue
+        class_mask = labels == class_idx
+        if not class_mask.any():
+            continue
+        targets[:, class_idx] = build_box_region_weights(
+            anchor_points,
+            boxes[class_mask],
+            unit_weights[class_mask],
+            center_sampling_radius=center_sampling_radius,
+        )
+    return targets
+
+
+def build_class_center_targets(
+    anchor_points: torch.Tensor,
+    boxes: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int,
+    sigma: float,
+    valid_class_mask: torch.Tensor,
+) -> torch.Tensor:
+    targets = anchor_points.new_zeros((anchor_points.shape[0], num_classes))
+    if boxes.numel() == 0:
+        return targets
+    for class_idx in range(num_classes):
+        if not valid_class_mask[class_idx]:
+            continue
+        class_mask = labels == class_idx
+        if not class_mask.any():
+            continue
+        targets[:, class_idx] = build_center_heat_targets(
+            anchor_points,
+            boxes[class_mask],
+            sigma=sigma,
+        )
+    return targets
+
+
+def roi_pool_class_maps(
+    class_maps: torch.Tensor,
+    boxes: torch.Tensor,
+    image_size: int,
+) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return class_maps.new_zeros((0, class_maps.shape[0], class_maps.shape[1]))
+    num_classes, channels, feat_h, feat_w = class_maps.shape
+    scale_x = feat_w / max(float(image_size), 1.0)
+    scale_y = feat_h / max(float(image_size), 1.0)
+    pooled = []
+    for box in boxes:
+        x1, y1, x2, y2 = box.tolist()
+        fx1 = int(max(0, min(round(x1 * scale_x), feat_w - 1)))
+        fy1 = int(max(0, min(round(y1 * scale_y), feat_h - 1)))
+        fx2 = int(max(fx1 + 1, min(round(x2 * scale_x), feat_w)))
+        fy2 = int(max(fy1 + 1, min(round(y2 * scale_y), feat_h)))
+        roi = class_maps[:, :, fy1:fy2, fx1:fx2]
+        pooled.append(roi.mean(dim=(-1, -2)))
+    return torch.stack(pooled, dim=0)
 
 
 class PromptTaskAlignedAssigner:
@@ -181,9 +238,6 @@ class PromptTaskAlignedAssigner:
 
         assignment_metric = torch.full((num_points,), -1.0, device=device)
         overlaps = torch.zeros(num_points, device=device)
-        pred_obj = pred_objectness.sigmoid()
-        pred_tgt = pred_targetness.sigmoid()
-
         for gt_idx, gt_box in enumerate(gt_boxes):
             class_idx = int(gt_labels[gt_idx].item())
             if class_idx < 0 or class_idx >= num_classes or not valid_class_mask[class_idx]:
@@ -208,9 +262,11 @@ class PromptTaskAlignedAssigner:
             candidate_boxes = pred_boxes[candidate_inds]
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
+            pred_obj = pred_objectness[candidate_inds, class_idx].sigmoid()
+            pred_tgt = pred_targetness[candidate_inds, class_idx].sigmoid()
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
             prior_scores = pred_slot_priors[candidate_inds, class_idx].clamp(min=1e-4)
-            quality = (pred_obj[candidate_inds] * pred_tgt[candidate_inds] * cls_scores * prior_scores).clamp(min=0.0).pow(0.25)
+            quality = (pred_obj * pred_tgt * cls_scores * prior_scores).clamp(min=0.0).pow(0.25)
             align = quality.pow(self.alpha) * ious.pow(self.beta) * center_prior
             topk = min(self.topk, candidate_inds.numel())
             top_align, top_pos = torch.topk(align, topk)
@@ -268,8 +324,6 @@ class PromptOneToOneAssigner:
         if gt_boxes.numel() == 0:
             return AssignmentResult(target_scores, target_boxes, fg_mask, matched_gt_indices, matched_labels, duplicate_mask)
 
-        pred_obj = pred_objectness.sigmoid()
-        pred_tgt = pred_targetness.sigmoid()
         duplicate_candidates: Dict[int, torch.Tensor] = {}
         pair_candidates: List[tuple[float, int, int]] = []
         for gt_idx, gt_box in enumerate(gt_boxes):
@@ -296,8 +350,10 @@ class PromptOneToOneAssigner:
             candidate_boxes = pred_boxes[candidate_inds]
             ious = bbox_iou(candidate_boxes, gt_box.unsqueeze(0)).squeeze(-1)
             cls_scores = pred_scores[candidate_inds, class_idx].sigmoid()
+            pred_obj = pred_objectness[candidate_inds, class_idx].sigmoid()
+            pred_tgt = pred_targetness[candidate_inds, class_idx].sigmoid()
             prior_scores = pred_slot_priors[candidate_inds, class_idx].clamp(min=1e-4)
-            quality = (pred_obj[candidate_inds] * pred_tgt[candidate_inds] * cls_scores * prior_scores).clamp(min=0.0).pow(0.25)
+            quality = (pred_obj * pred_tgt * cls_scores * prior_scores).clamp(min=0.0).pow(0.25)
             center_prior = center_delta[candidate_inds].pow(2).sum(dim=1).mul(-0.5).exp()
             metric = quality * ious.pow(2) * center_prior.pow(2)
             top_limit = min(candidate_inds.numel(), self.candidate_topk)
@@ -369,6 +425,64 @@ class PromptDetectionLoss(torch.nn.Module):
         )
         self.dfl = DFLoss(reg_max)
 
+    def _roi_contrast_loss(
+        self,
+        class_maps: torch.Tensor,
+        scale_tokens: torch.Tensor,
+        gt_boxes: torch.Tensor,
+        gt_labels: torch.Tensor,
+        non_target_boxes: torch.Tensor,
+        non_target_weights: torch.Tensor,
+        valid_class_mask: torch.Tensor,
+        image_size: int,
+    ) -> torch.Tensor:
+        valid_indices = torch.nonzero(valid_class_mask, as_tuple=False).squeeze(1)
+        if valid_indices.numel() == 0:
+            return class_maps.new_tensor(0.0)
+
+        class_maps = class_maps[valid_indices]
+        scale_tokens = F.normalize(scale_tokens[valid_indices], dim=-1, eps=1e-6)
+        total_loss = class_maps.new_tensor(0.0)
+        loss_terms = 0
+
+        if gt_boxes.numel() > 0:
+            pooled = roi_pool_class_maps(class_maps, gt_boxes, image_size=image_size)
+            pooled = F.normalize(pooled, dim=-1, eps=1e-6)
+            logits = (pooled * scale_tokens.unsqueeze(0)).sum(dim=-1)
+            target_positions = torch.full_like(gt_labels, -1)
+            for offset, class_idx in enumerate(valid_indices.tolist()):
+                target_positions[gt_labels == class_idx] = offset
+            positive_mask = target_positions >= 0
+            if positive_mask.any():
+                positive_logits = logits[positive_mask, target_positions[positive_mask]]
+                if logits.shape[1] > 1:
+                    negative_logits = logits[positive_mask].clone()
+                    negative_logits.scatter_(1, target_positions[positive_mask].unsqueeze(1), -1e4)
+                    hardest_negative = negative_logits.max(dim=-1).values
+                    total_loss = total_loss + F.relu(
+                        self.cfg.classification_margin - (positive_logits - hardest_negative)
+                    ).mean()
+                else:
+                    total_loss = total_loss + F.relu(self.cfg.classification_margin - positive_logits).mean()
+                loss_terms += 1
+
+        if non_target_boxes.numel() > 0:
+            pooled = roi_pool_class_maps(class_maps, non_target_boxes, image_size=image_size)
+            pooled = F.normalize(pooled, dim=-1, eps=1e-6)
+            logits = (pooled * scale_tokens.unsqueeze(0)).sum(dim=-1)
+            weights = non_target_weights
+            if weights.numel() != logits.shape[0]:
+                weights = logits.new_ones((logits.shape[0],))
+            total_loss = total_loss + weighted_mean(
+                F.relu(logits.max(dim=-1).values - self.cfg.non_target_logit_margin),
+                weights,
+            )
+            loss_terms += 1
+
+        if loss_terms == 0:
+            return total_loss
+        return total_loss / loss_terms
+
     def _branch_loss(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -380,21 +494,20 @@ class PromptDetectionLoss(torch.nn.Module):
         pred_slot_priors = outputs["pred_slot_priors"]
         pred_objectness = outputs["pred_objectness"]
         pred_targetness = outputs["pred_targetness"]
-        pred_null_logits = outputs["pred_null_logits"]
         anchor_points = outputs["anchor_points"]
         stride_tensor = outputs["stride_tensor"]
         box_logits = outputs["box_distribution"]
         class_mask = outputs["class_mask"]
+        roi_feature_maps = outputs["roi_feature_maps"]["p3"]
+        roi_scale_tokens = outputs["roi_scale_tokens"]
 
         total_objectness = pred_scores.new_tensor(0.0)
         total_targetness = pred_scores.new_tensor(0.0)
-        total_null = pred_scores.new_tensor(0.0)
         total_match = pred_scores.new_tensor(0.0)
         total_iou = pred_scores.new_tensor(0.0)
         total_dfl = pred_scores.new_tensor(0.0)
         total_box_prior = pred_scores.new_tensor(0.0)
-        total_contrast = pred_scores.new_tensor(0.0)
-        total_joint_score = pred_scores.new_tensor(0.0)
+        total_roi_contrast = pred_scores.new_tensor(0.0)
         total_pos = 0
         total_neg = 0
         total_pos_score_sum = pred_scores.new_tensor(0.0)
@@ -422,6 +535,22 @@ class PromptDetectionLoss(torch.nn.Module):
 
             valid_logits = pred_scores[batch_idx][:, valid_class_mask]
             valid_targets = assign.target_scores[:, valid_class_mask]
+            class_region_targets = build_class_region_targets(
+                anchor_points,
+                gt_boxes,
+                gt_labels,
+                pred_scores.shape[-1],
+                center_sampling_radius=non_target_radius,
+                valid_class_mask=valid_class_mask,
+            )[:, valid_class_mask]
+            class_center_targets = build_class_center_targets(
+                anchor_points,
+                gt_boxes,
+                gt_labels,
+                pred_scores.shape[-1],
+                sigma=self.cfg.center_target_sigma,
+                valid_class_mask=valid_class_mask,
+            )[:, valid_class_mask]
             total_match = total_match + sigmoid_varifocal_loss(
                 valid_logits,
                 valid_targets,
@@ -429,23 +558,16 @@ class PromptDetectionLoss(torch.nn.Module):
                 gamma=self.cfg.focal_gamma,
                 reduction="mean",
             )
-
-            objectness_target = assign.target_scores.max(dim=-1).values
-            center_target = build_center_heat_targets(
-                anchor_points,
-                gt_boxes,
-                sigma=self.cfg.center_target_sigma,
-            )
             total_objectness = total_objectness + sigmoid_varifocal_loss(
-                pred_objectness[batch_idx],
-                objectness_target,
+                pred_objectness[batch_idx][:, valid_class_mask],
+                class_region_targets,
                 alpha=self.cfg.focal_alpha,
                 gamma=self.cfg.focal_gamma,
                 reduction="mean",
             )
             total_targetness = total_targetness + sigmoid_varifocal_loss(
-                pred_targetness[batch_idx],
-                center_target,
+                pred_targetness[batch_idx][:, valid_class_mask],
+                class_center_targets,
                 alpha=self.cfg.focal_alpha,
                 gamma=self.cfg.focal_gamma,
                 reduction="mean",
@@ -453,108 +575,47 @@ class PromptDetectionLoss(torch.nn.Module):
             pred_prob = pred_scores[batch_idx].sigmoid()
             pred_obj = pred_objectness[batch_idx].sigmoid()
             pred_tgt = pred_targetness[batch_idx].sigmoid()
-            prompt_gate = (valid_logits - pred_null_logits[batch_idx].unsqueeze(-1)).sigmoid()
-            joint_scores = (pred_prob[:, valid_class_mask] * pred_obj.unsqueeze(-1) * pred_tgt.unsqueeze(-1) * prompt_gate).clamp(1e-6, 1.0 - 1e-6)
-            null_terms = []
-            hard_neg_prompt_logits = None
-            hard_neg_null_logits = None
             if assign.fg_mask.any():
                 pos_labels = assign.matched_labels[assign.fg_mask]
-                pos_prompt_logits = valid_logits[assign.fg_mask].gather(1, pos_labels.unsqueeze(1)).squeeze(1)
-                pos_null_logits = pred_null_logits[batch_idx][assign.fg_mask]
-                null_terms.append(
-                    F.binary_cross_entropy_with_logits(
-                        pos_null_logits,
-                        torch.zeros_like(pos_null_logits),
-                        reduction="mean",
-                    )
-                )
-                null_terms.append(
-                    self.cfg.prompt_null_weight * F.relu(
-                        self.cfg.prompt_null_margin - (pos_prompt_logits - pos_null_logits)
-                    ).mean()
-                )
-            neg_mask = ~assign.fg_mask
-            if neg_mask.any():
-                neg_joint_scores = joint_scores[neg_mask].max(dim=-1).values
-                hard_limit = max(
-                    self.cfg.null_min_negatives,
-                    int(math.ceil(assign.fg_mask.sum().item() * self.cfg.null_neg_pos_ratio)),
-                )
-                hard_limit = min(hard_limit, int(neg_joint_scores.numel()))
-                if hard_limit > 0:
-                    hard_idx = torch.topk(neg_joint_scores, k=hard_limit).indices
-                    hard_neg_logits = pred_null_logits[batch_idx][neg_mask][hard_idx]
-                    hard_neg_prompt_logits = valid_logits[neg_mask][hard_idx].max(dim=-1).values
-                    hard_neg_null_logits = hard_neg_logits
-                    null_terms.append(
-                        F.binary_cross_entropy_with_logits(
-                            hard_neg_logits,
-                            torch.ones_like(hard_neg_logits),
-                            reduction="mean",
-                        )
-                    )
-                    null_terms.append(
-                        self.cfg.prompt_null_weight * F.relu(
-                            self.cfg.prompt_null_margin + hard_neg_prompt_logits - hard_neg_null_logits
-                        ).mean()
-                    )
-            if null_terms:
-                total_null = total_null + torch.stack(null_terms).mean()
-
-            if assign.fg_mask.any():
                 pos_boxes = pred_boxes[batch_idx][assign.fg_mask]
                 tgt_boxes = assign.target_boxes[assign.fg_mask]
                 iou = bbox_ciou(pos_boxes, tgt_boxes)
                 total_iou = total_iou + (1 - iou).mean()
                 total_matched_iou_sum = total_matched_iou_sum + bbox_iou(pos_boxes, tgt_boxes).sum()
 
-                pos_labels = assign.matched_labels[assign.fg_mask]
-                pos_joint_scores = torch.sqrt(
-                    (pred_obj[assign.fg_mask] * pred_tgt[assign.fg_mask] * pred_prob[assign.fg_mask, pos_labels]).clamp(min=0.0)
-                )
+                pos_joint_scores = (
+                    pred_obj[assign.fg_mask, pos_labels]
+                    * pred_tgt[assign.fg_mask, pos_labels]
+                    * pred_prob[assign.fg_mask, pos_labels]
+                ).clamp(min=0.0).pow(1.0 / 3.0)
                 total_pos_score_sum = total_pos_score_sum + pos_joint_scores.sum()
-                total_joint_score = total_joint_score + safe_prob_bce(
-                    joint_scores[assign.fg_mask].gather(1, pos_labels.unsqueeze(1)).squeeze(1),
-                    assign.target_scores[assign.fg_mask, pos_labels].clamp(min=0.1, max=1.0),
-                    reduction="mean",
-                )
 
                 pos_logits = box_logits[batch_idx][assign.fg_mask]
                 tgt_dist = bbox2dist(anchor_points[assign.fg_mask], tgt_boxes, self.reg_max, stride_tensor[assign.fg_mask])
                 total_dfl = total_dfl + self.dfl(pos_logits.reshape(-1, self.reg_max), tgt_dist.reshape(-1)).mean()
                 total_pos += int(assign.fg_mask.sum().item())
 
-                if valid_class_mask.sum() > 1:
-                    contrast_logits = pred_scores[batch_idx][assign.fg_mask][:, valid_class_mask]
-                    hardest_negative = contrast_logits.masked_fill(
-                        F.one_hot(pos_labels, num_classes=contrast_logits.shape[1]).bool(),
-                        -1e4,
-                    ).max(dim=-1).values
-                    positive_logit = contrast_logits.gather(1, pos_labels.unsqueeze(1)).squeeze(1)
-                    total_contrast = total_contrast + F.relu(
-                        self.cfg.classification_margin - (positive_logit - hardest_negative)
-                    ).mean()
-
             if assign.duplicate_mask.any():
-                dup_zero = torch.zeros_like(pred_objectness[batch_idx][assign.duplicate_mask])
+                dup_zero = torch.zeros_like(pred_objectness[batch_idx][assign.duplicate_mask][:, valid_class_mask])
                 total_objectness = total_objectness + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
-                    pred_objectness[batch_idx][assign.duplicate_mask],
+                    pred_objectness[batch_idx][assign.duplicate_mask][:, valid_class_mask],
                     dup_zero,
                     alpha=self.cfg.focal_alpha,
                     gamma=self.cfg.focal_gamma,
                     reduction="mean",
                 )
                 total_targetness = total_targetness + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
-                    pred_targetness[batch_idx][assign.duplicate_mask],
+                    pred_targetness[batch_idx][assign.duplicate_mask][:, valid_class_mask],
                     dup_zero,
                     alpha=self.cfg.focal_alpha,
                     gamma=self.cfg.focal_gamma,
                     reduction="mean",
                 )
-                total_joint_score = total_joint_score + self.cfg.duplicate_weight * safe_prob_bce(
-                    joint_scores[assign.duplicate_mask],
-                    torch.zeros_like(joint_scores[assign.duplicate_mask]),
+                total_match = total_match + self.cfg.duplicate_weight * sigmoid_varifocal_loss(
+                    pred_scores[batch_idx][assign.duplicate_mask][:, valid_class_mask],
+                    dup_zero,
+                    alpha=self.cfg.focal_alpha,
+                    gamma=self.cfg.focal_gamma,
                     reduction="mean",
                 )
 
@@ -577,8 +638,8 @@ class PromptDetectionLoss(torch.nn.Module):
                 region_weights = non_target_region_weights[non_target_mask]
                 total_objectness = total_objectness + weighted_mean(
                     sigmoid_varifocal_loss(
-                        pred_objectness[batch_idx][non_target_mask],
-                        torch.zeros_like(pred_objectness[batch_idx][non_target_mask]),
+                        pred_objectness[batch_idx][non_target_mask][:, valid_class_mask],
+                        torch.zeros_like(pred_objectness[batch_idx][non_target_mask][:, valid_class_mask]),
                         alpha=self.cfg.focal_alpha,
                         gamma=self.cfg.focal_gamma,
                         reduction="none",
@@ -587,8 +648,8 @@ class PromptDetectionLoss(torch.nn.Module):
                 )
                 total_targetness = total_targetness + weighted_mean(
                     sigmoid_varifocal_loss(
-                        pred_targetness[batch_idx][non_target_mask],
-                        torch.zeros_like(pred_targetness[batch_idx][non_target_mask]),
+                        pred_targetness[batch_idx][non_target_mask][:, valid_class_mask],
+                        torch.zeros_like(pred_targetness[batch_idx][non_target_mask][:, valid_class_mask]),
                         alpha=self.cfg.focal_alpha,
                         gamma=self.cfg.focal_gamma,
                         reduction="none",
@@ -607,26 +668,6 @@ class PromptDetectionLoss(torch.nn.Module):
                         ),
                         region_weights,
                     )
-                    total_contrast = total_contrast + weighted_mean(
-                        max_prompt_logit_margin_loss(non_target_scores, margin=self.cfg.non_target_logit_margin),
-                        region_weights,
-                    )
-                    non_target_prompt_logits = non_target_scores.max(dim=-1).values
-                    non_target_null_logits = pred_null_logits[batch_idx][non_target_mask]
-                    total_null = total_null + self.cfg.prompt_null_weight * weighted_mean(
-                        F.relu(
-                            self.cfg.prompt_null_margin + non_target_prompt_logits - non_target_null_logits
-                        ),
-                        region_weights,
-                    )
-                    total_joint_score = total_joint_score + weighted_mean(
-                        safe_prob_bce(
-                            joint_scores[non_target_mask],
-                            torch.zeros_like(joint_scores[non_target_mask]),
-                            reduction="none",
-                        ),
-                        region_weights,
-                    )
                 non_target_priors = pred_slot_priors[batch_idx][non_target_mask][:, valid_class_mask]
                 if non_target_priors.numel() > 0:
                     total_box_prior = total_box_prior + 0.25 * weighted_mean(
@@ -634,18 +675,29 @@ class PromptDetectionLoss(torch.nn.Module):
                         region_weights,
                     )
 
+            total_roi_contrast = total_roi_contrast + self._roi_contrast_loss(
+                roi_feature_maps[batch_idx],
+                roi_scale_tokens[batch_idx],
+                gt_boxes,
+                gt_labels,
+                non_target_boxes,
+                non_target_weights,
+                valid_class_mask,
+                image_size=target["image_size"],
+            )
+
+            neg_mask = ~assign.fg_mask
             neg_count = int(neg_mask.sum().item())
             if neg_count > 0:
                 total_neg += neg_count
-                neg_scores = pred_prob[neg_mask][:, valid_class_mask]
+                neg_scores = (
+                    pred_prob[neg_mask][:, valid_class_mask]
+                    * pred_obj[neg_mask][:, valid_class_mask]
+                    * pred_tgt[neg_mask][:, valid_class_mask]
+                )
                 if neg_scores.numel() > 0:
-                    neg_joint_scores = joint_scores[neg_mask].max(dim=-1).values.pow(1.0 / 3.0)
+                    neg_joint_scores = neg_scores.max(dim=-1).values.pow(1.0 / 3.0)
                     total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
-                    total_joint_score = total_joint_score + safe_prob_bce(
-                        joint_scores[neg_mask],
-                        torch.zeros_like(joint_scores[neg_mask]),
-                        reduction="mean",
-                    )
 
             oversize_idx = torch.nonzero(~assign.fg_mask, as_tuple=False).squeeze(1)
             if oversize_idx.numel() > 0:
@@ -662,13 +714,11 @@ class PromptDetectionLoss(torch.nn.Module):
         return {
             "loss_objectness": total_objectness / num_batches,
             "loss_targetness": total_targetness / num_batches,
-            "loss_null": total_null / num_batches,
             "loss_match": total_match / num_batches,
             "loss_iou": total_iou / num_batches,
             "loss_dfl": total_dfl / num_batches,
             "loss_box_prior": total_box_prior / num_batches,
-            "loss_contrast": total_contrast / num_batches,
-            "loss_joint_score": total_joint_score / num_batches,
+            "loss_roi_contrast": total_roi_contrast / num_batches,
             "num_pos": pred_scores.new_tensor(float(total_pos)),
             "num_neg": pred_scores.new_tensor(float(total_neg)),
             "mean_pos_score": (total_pos_score_sum / max(total_pos, 1)).detach(),
@@ -782,24 +832,20 @@ class PromptDetectionLoss(torch.nn.Module):
         loss_one2many = (
             self.cfg.objectness_weight * one2many["loss_objectness"]
             + self.cfg.targetness_weight * one2many["loss_targetness"]
-            + self.cfg.null_weight * one2many["loss_null"]
             + self.cfg.match_weight * one2many["loss_match"]
             + self.cfg.iou_weight * one2many["loss_iou"]
             + self.cfg.dfl_weight * one2many["loss_dfl"]
             + one2many["loss_box_prior"]
-            + self.cfg.contrast_weight * one2many["loss_contrast"]
-            + self.cfg.joint_score_weight * one2many["loss_joint_score"]
+            + self.cfg.contrast_weight * one2many["loss_roi_contrast"]
         )
         loss_one2one = (
             self.cfg.objectness_weight * one2one["loss_objectness"]
             + self.cfg.targetness_weight * one2one["loss_targetness"]
-            + self.cfg.null_weight * one2one["loss_null"]
             + self.cfg.match_weight * one2one["loss_match"]
             + self.cfg.iou_weight * one2one["loss_iou"]
             + self.cfg.dfl_weight * one2one["loss_dfl"]
             + one2one["loss_box_prior"]
-            + self.cfg.contrast_weight * one2one["loss_contrast"]
-            + self.cfg.joint_score_weight * one2one["loss_joint_score"]
+            + self.cfg.contrast_weight * one2one["loss_roi_contrast"]
         )
         total_loss = (
             self.cfg.one2many_weight * loss_one2many
@@ -818,13 +864,11 @@ class PromptDetectionLoss(torch.nn.Module):
             "loss_canvas": grounding["loss_canvas"],
             "loss_objectness": one2one["loss_objectness"],
             "loss_targetness": one2one["loss_targetness"],
-            "loss_null": one2one["loss_null"],
             "loss_match": one2one["loss_match"],
             "loss_iou": one2one["loss_iou"],
             "loss_dfl": one2one["loss_dfl"],
             "loss_box_prior": one2one["loss_box_prior"],
-            "loss_contrast": one2one["loss_contrast"],
-            "loss_joint_score": one2one["loss_joint_score"],
+            "loss_roi_contrast": one2one["loss_roi_contrast"],
             "loss_slot": grounding["loss_slot"],
             "loss_fg": grounding["loss_fg"],
             "loss_center": grounding["loss_center"],

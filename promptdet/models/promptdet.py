@@ -59,7 +59,6 @@ class PromptDET(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(cfg.logit_scale_init))
         self.context_prior_strength = 1.0
         self.slot_prior_logit_scale = nn.Parameter(torch.tensor(1.0))
-        self.null_memory = nn.Parameter(torch.randn(self.context_cfg.slot_memory_tokens, cfg.prompt_dim))
 
     def set_context_prior_strength(self, strength: float) -> None:
         self.context_prior_strength = float(strength)
@@ -118,7 +117,7 @@ class PromptDET(nn.Module):
             prompt_instance_mask,
             prompt_class_mask,
         )
-        query_feats = self.prompt_fusion(query_feats, prompt_encoding)
+        fusion_outputs = self.prompt_fusion(query_feats, prompt_encoding)
         grounding = self.grounder(
             prompt_boxes,
             prompt_hint_maps,
@@ -127,26 +126,20 @@ class PromptDET(nn.Module):
             prompt_class_indices,
             prompt_instance_mask,
             prompt_class_mask,
-            query_feats,
+            fusion_outputs["shared_feats"],
             query_target_map,
         )
-        class_detail_tokens = prompt_encoding["class_detail_tokens"]
-        bsz, num_slots, num_tokens, dim = class_detail_tokens.shape
-        pooled_detail = F.adaptive_avg_pool1d(
-            class_detail_tokens.permute(0, 1, 3, 2).reshape(bsz * num_slots, dim, num_tokens),
-            output_size=self.context_cfg.slot_memory_tokens,
-        ).reshape(bsz, num_slots, dim, self.context_cfg.slot_memory_tokens).permute(0, 1, 3, 2)
-        slot_memory = torch.cat([grounding["slot_memory"], pooled_detail], dim=2)
         branches = self.head(
             grounding["fused_feats"],
+            fusion_outputs["class_feats"],
             fg_prior_pyramid=grounding["fg_prior_pyramid"],
             slot_prior_pyramid=grounding["slot_prior_pyramid"],
         )
         max_scale = math.exp(self.cfg.max_logit_scale)
         logit_scale = self.logit_scale.exp().clamp(min=1.0, max=max_scale)
         for branch in branches.values():
-            branch["slot_memory"] = slot_memory
             branch["class_prototypes"] = prompt_encoding["class_prototypes"]
+            branch["class_scale_tokens"] = prompt_encoding["scale_tokens"]
             branch["class_mask"] = grounding["class_mask"]
             branch["logit_scale"] = logit_scale
         branches["context_aux"] = {
@@ -168,7 +161,6 @@ class PromptDET(nn.Module):
         targetness_logits = outputs["targetness_logits"]
         class_embeddings = outputs["class_embeddings"]
         slot_prior_maps = outputs.get("slot_prior_maps", [])
-        slot_memory = outputs["slot_memory"]
         class_prototypes = outputs["class_prototypes"]
         class_mask = outputs["class_mask"]
         logit_scale = outputs["logit_scale"]
@@ -185,12 +177,9 @@ class PromptDET(nn.Module):
         stride_parts = []
         prior_parts = []
         flat_box_logits = []
-        slot_memory = F.normalize(slot_memory, dim=-1, eps=1e-6)
         class_prototypes = F.normalize(class_prototypes, dim=-1, eps=1e-6)
-        null_memory = F.normalize(self.null_memory, dim=-1, eps=1e-6)
-        null_parts = []
-        detail_weight = float(self.cfg.detail_score_weight)
-        detail_weight = min(max(detail_weight, 0.0), 1.0)
+        roi_feature_maps = outputs["roi_feature_maps"]
+        roi_scale_tokens = outputs["class_scale_tokens"]["p3"]
         for level_idx, (box_logit, objectness_logit, targetness_logit, class_embedding, stride) in enumerate(zip(
             box_logits,
             objectness_logits,
@@ -206,14 +195,16 @@ class PromptDET(nn.Module):
             dist = (probs * self.proj_bins.to(device)).sum(dim=-1) * stride
             box_parts.append(dist)
             flat_box_logits.append(box_logit)
-            flat_objectness = objectness_logit.flatten(2).transpose(1, 2).squeeze(-1)
+            flat_objectness = objectness_logit.squeeze(2).flatten(2).transpose(1, 2)
             objectness_parts.append(flat_objectness)
-            flat_targetness = targetness_logit.flatten(2).transpose(1, 2).squeeze(-1)
+            flat_targetness = targetness_logit.squeeze(2).flatten(2).transpose(1, 2)
             targetness_parts.append(flat_targetness)
-            flat_embeddings = F.normalize(class_embedding.flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
-            detail_scores = torch.einsum("bnd,bktd->bnkt", flat_embeddings, slot_memory).max(dim=-1).values
-            prototype_scores = torch.einsum("bnd,bkd->bnk", flat_embeddings, class_prototypes)
-            level_scores = (detail_weight * detail_scores + (1.0 - detail_weight) * prototype_scores) * logit_scale
+            flat_embeddings = F.normalize(
+                class_embedding.permute(0, 3, 4, 1, 2).reshape(b, h * w, class_embedding.shape[1], -1),
+                dim=-1,
+                eps=1e-6,
+            )
+            level_scores = (flat_embeddings * class_prototypes.unsqueeze(1)).sum(dim=-1) * logit_scale
             if slot_prior_maps:
                 flat_slot_prior = slot_prior_maps[level_idx].flatten(2).transpose(1, 2)
                 cls_prior = flat_slot_prior[:, :, 1:]
@@ -227,10 +218,8 @@ class PromptDET(nn.Module):
                 prior_parts.append(cls_prior)
             else:
                 prior_parts.append(level_scores.new_ones(level_scores.shape))
-            level_null = torch.einsum("bnd,td->bnt", flat_embeddings, null_memory).max(dim=-1).values * logit_scale
             level_scores = level_scores.masked_fill(~class_mask.unsqueeze(1), -1e4)
             score_parts.append(level_scores)
-            null_parts.append(level_null)
             stride_parts.append(torch.full((h * w, 1), stride, device=device))
 
         pred_dist = torch.cat(box_parts, dim=1)
@@ -245,13 +234,14 @@ class PromptDET(nn.Module):
             "pred_scores": torch.cat(score_parts, dim=1),
             "pred_objectness": pred_objectness,
             "pred_targetness": torch.cat(targetness_parts, dim=1),
-            "pred_null_logits": torch.cat(null_parts, dim=1),
             "pred_slot_priors": torch.cat(prior_parts, dim=1),
             "anchor_points": anchor_points,
             "stride_tensor": torch.cat(stride_parts, dim=0),
             "box_distribution": torch.cat(flat_box_logits, dim=1),
             "class_mask": class_mask,
             "feature_shapes": feature_shapes,
+            "roi_feature_maps": roi_feature_maps,
+            "roi_scale_tokens": roi_scale_tokens,
         }
 
     def decode_raw(
@@ -289,7 +279,6 @@ class PromptDET(nn.Module):
         pred_scores = pred_logits.sigmoid()
         pred_objectness = branch["pred_objectness"].sigmoid()
         pred_targetness = branch["pred_targetness"].sigmoid()
-        pred_null_logits = branch["pred_null_logits"]
         decoded_class_mask = branch["class_mask"]
         feature_shapes = branch["feature_shapes"]
 
@@ -311,7 +300,8 @@ class PromptDET(nn.Module):
 
             valid_class_ids = padded_class_ids[effective_mask]
             valid_scores = class_scores[:, effective_mask]
-            valid_logits = class_logits[:, effective_mask]
+            valid_objectness = pred_objectness[batch_idx][:, effective_mask]
+            valid_targetness = pred_targetness[batch_idx][:, effective_mask]
             if valid_scores.numel() == 0:
                 results.append({
                     "boxes": boxes.new_zeros((0, 4)),
@@ -323,23 +313,11 @@ class PromptDET(nn.Module):
             per_class_boxes = []
             per_class_scores = []
             per_class_labels = []
-            prompt_vs_null = (valid_logits - pred_null_logits[batch_idx].unsqueeze(-1)).sigmoid()
-            if valid_logits.shape[1] > 1:
-                competing_logits = []
-                for class_offset in range(valid_logits.shape[1]):
-                    class_selector = torch.zeros_like(valid_logits, dtype=torch.bool)
-                    class_selector[:, class_offset] = True
-                    competing_logits.append(valid_logits.masked_fill(class_selector, -1e4).max(dim=1).values)
-                competing_logits = torch.stack(competing_logits, dim=1)
-                class_margin_gate = (valid_logits - competing_logits - 0.2).sigmoid()
-            else:
-                class_margin_gate = torch.ones_like(prompt_vs_null)
             score_matrix = (
                 valid_scores
-                * pred_objectness[batch_idx].unsqueeze(-1)
-                * pred_targetness[batch_idx].unsqueeze(-1)
+                * valid_objectness
+                * valid_targetness
             ).clamp(min=0.0)
-            score_matrix = score_matrix * prompt_vs_null.square() * class_margin_gate
             winning_class = score_matrix.argmax(dim=1)
             for class_offset, label in enumerate(valid_class_ids):
                 class_assignment = winning_class == class_offset

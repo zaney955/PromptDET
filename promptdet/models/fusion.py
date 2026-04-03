@@ -21,6 +21,7 @@ class PromptQueryFusionBlock(nn.Module):
         self.sim_proj = nn.Conv2d(channels, channels, 1)
         self.null_prompt = nn.Parameter(torch.randn(1, prompt_dim))
         self.null_scale_token = nn.Parameter(torch.randn(1, channels))
+        self.class_refine = ConvBNAct(channels + 2, channels, 3)
         self.refine = ConvBNAct(channels + 6, channels, 3)
 
     @staticmethod
@@ -49,7 +50,7 @@ class PromptQueryFusionBlock(nn.Module):
         instance_class_indices: torch.Tensor,
         instance_mask: torch.Tensor,
         instance_scale_tokens: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         b, c, h, w = x.shape
         query = x.flatten(2).transpose(1, 2)
         query = self.query_norm(query)
@@ -90,6 +91,12 @@ class PromptQueryFusionBlock(nn.Module):
             query.unsqueeze(2) * (1.0 + class_gamma.unsqueeze(1))
             + class_beta.unsqueeze(1)
         ) * combined_class_presence.unsqueeze(-1)
+        class_query_maps = class_branch.transpose(1, 2).transpose(2, 3).reshape(
+            b * class_prototypes.shape[1],
+            c,
+            h,
+            w,
+        )
         query = query + 0.5 * (
             class_branch.max(dim=2).values
             + class_branch.sum(dim=2) / active_class_count.unsqueeze(1)
@@ -123,7 +130,7 @@ class PromptQueryFusionBlock(nn.Module):
         mean_sim_presence = (combined_sim_presence.sum(dim=-1) / active_class_count).reshape(b, 1, h, w)
         peak_instance_presence = instance_presence.max(dim=-1).values.reshape(b, 1, h, w)
         peak_instance_sim_presence = instance_sim_presence.max(dim=-1).values.reshape(b, 1, h, w)
-        return self.refine(
+        shared_feat = self.refine(
             torch.cat(
                 [
                     x,
@@ -137,6 +144,20 @@ class PromptQueryFusionBlock(nn.Module):
                 dim=1,
             )
         )
+        class_presence_map = combined_class_presence.transpose(1, 2).reshape(b * class_prototypes.shape[1], 1, h, w)
+        class_sim_map = combined_sim_presence.transpose(1, 2).reshape(b * class_prototypes.shape[1], 1, h, w)
+        class_feat = self.class_refine(
+            torch.cat(
+                [
+                    class_query_maps,
+                    class_presence_map,
+                    class_sim_map,
+                ],
+                dim=1,
+            )
+        ).reshape(b, class_prototypes.shape[1], c, h, w)
+        class_feat = class_feat * class_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).float()
+        return shared_feat, class_feat
 
 
 class PromptFusionNeck(nn.Module):
@@ -148,10 +169,11 @@ class PromptFusionNeck(nn.Module):
             "p5": PromptQueryFusionBlock(channels, prompt_dim, num_heads),
         })
 
-    def forward(self, feats: Dict[str, torch.Tensor], prompt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        outputs = {}
+    def forward(self, feats: Dict[str, torch.Tensor], prompt: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
+        shared_outputs = {}
+        class_outputs = {}
         for name, feat in feats.items():
-            outputs[name] = self.blocks[name](
+            shared_feat, class_feat = self.blocks[name](
                 feat,
                 prompt["memory_tokens"],
                 prompt["memory_mask"],
@@ -163,4 +185,9 @@ class PromptFusionNeck(nn.Module):
                 prompt["instance_mask"],
                 prompt["instance_scale_tokens"][name],
             )
-        return outputs
+            shared_outputs[name] = shared_feat
+            class_outputs[name] = class_feat
+        return {
+            "shared_feats": shared_outputs,
+            "class_feats": class_outputs,
+        }

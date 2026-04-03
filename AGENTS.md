@@ -16,15 +16,17 @@
   - unique assignment during training
   - local peak filtering during inference
 - The score used at inference is a quality-aware prompt-conditioned score, not a pure objectness score and not a pure class score.
-- PromptDET currently works best when prompt matching uses both:
-  - category-level global prototypes
-  - category-level detail / token memory
-  Do not collapse matching back to a single local-token `max` path or a closed-set classifier style head.
+- PromptDET currently works best when the query side keeps explicit category-conditional feature maps through the detection head, rather than collapsing categories too early back into a single shared query map.
+- Prompt matching should stay prototype-centered. Do not rely on prompt-vs-null patches, slot-memory patches, or single local-token `max` matching as the main source of class evidence.
 
 ## Prompt Conditioning Rules
 - Prompt classes are represented by dynamically aggregated visual prototypes.
 - When multiple prompt instances belong to the same category, their features should be fused first to form a more stable category-level prompt representation.
 - Different prompt categories should not be forced to compete too early inside a shared prompt-conditioning path. Prefer category-wise conditional branches or other designs that keep cross-category interference low until late aggregation.
+- The current validated direction is:
+  - use a shared query trunk for generic localization context
+  - derive category-conditional query feature maps for active prompt classes
+  - keep those category-conditional maps alive through the detection head
 - Prompt slot indices are randomized per episode. This is intentional and must be preserved.
 - Do not add logic that lets the model memorize fixed dataset `category_id -> slot` mappings.
 - Any new feature must continue to work when prompt classes appear:
@@ -58,6 +60,7 @@
 
 ## Detection Head and Loss Guidelines
 - Keep objectness and prompt-classification separated conceptually.
+- The validated design is class-conditional `objectness`, class-conditional `targetness`, and class-conditional prompt matching on top of a shared box branch. Do not regress to a single shared foreground score for all prompt classes.
 - Background rejection should not rely only on threshold tuning.
 - Box regression should be supervised with quality-aware matching and center-aware assignment.
 - If duplicates reappear, fix assignment or one-to-one supervision first, not post-processing first.
@@ -68,7 +71,12 @@
   - class margin / calibration
   instead of adding closed-set shortcuts.
 - Negative supervision for prompt-conditioned scores must suppress all active prompt classes on non-target regions, not only the current max-scoring class.
-- If `joint_score` or related quality-aware scoring losses are modified, keep them aligned with inference scoring semantics. Do not train one notion of quality and decode with another.
+- For class confusion, prefer direct supervision on class-conditional maps:
+  - per-class region targets for objectness
+  - per-class center targets for targetness
+  - ROI-level contrastive rejection on labeled non-target objects
+- ROI contrast on non-target labeled boxes is a validated optimization path. Use it to push non-target object features away from all active prompt classes, not just to lower final logits after the fact.
+- Remove stale auxiliary losses once a cleaner class-conditional formulation replaces them. Do not accumulate `null`, `joint-score`, or similar patch losses after they stop matching the main inference path.
 - Context / grounding priors may assist ranking, but they must remain auxiliary. Do not let slot priors become the sole source of class evidence.
 
 ## Inference Rules
@@ -91,7 +99,7 @@
 - NMS is not part of the intended final architecture.
 - Do not use shared `objectness * targetness` peak filtering as the main candidate selector before prompt-class assignment. That design was empirically shown to leak non-prompt objects into active classes.
 - Local peak filtering must operate after prompt-conditioned class ownership is decided, not before.
-- Keep prompt-vs-null gating and class-margin gating in the final inference score. Prompt-conditioned rejection must be part of the main score, not a post-hoc heuristic.
+- The validated final score is the per-class quality score built from class-conditioned classification, objectness, and targetness. Do not reintroduce prompt-vs-null or detail-score patches into the default inference path unless a new ablation clearly beats the simpler class-conditional score.
 
 ## Data and Toy Dataset
 - `toy_data` labels must stay consistent with the generated `train.txt`, `val.txt`, `classes.txt`, and `prompt_set.json`.
@@ -103,6 +111,13 @@
 - Keep a controllable hard-positive sampling path that deliberately includes positive query images containing unrelated labeled objects, so the model learns `detect prompted targets` and `reject non-prompt objects in positive scenes` simultaneously.
 - Negative episodes remain important for empty-set rejection, but they are not sufficient to solve the dominant precision failure mode. Do not rely on negative episodes alone to teach non-prompt rejection.
 - When ranking positive query candidates, coverage of prompt classes and number of prompt instances still matter, but training must also expose the model to cluttered mixed-object scenes.
+
+## Validated Success Factors
+- The biggest precision gains came from moving prompt conditioning deeper into the query path, not from threshold tuning.
+- The most effective structural change was preserving per-class query feature maps through fusion and detection, then decoding with one-anchor-to-one-class ownership before local peak filtering.
+- The most effective supervision change was replacing shared foreground supervision with class-exclusive supervision on active prompt classes.
+- The most effective hard-negative signal was labeled non-target objects inside positive scenes. Treat them as a dedicated rejection target, not as generic background.
+- Cleaning out obsolete patch logic improved reliability. Simpler aligned training and inference semantics worked better than stacking more rescue terms on top of a misaligned head.
 
 ## Error Analysis Requirements
 - Precision analysis must explicitly separate:
