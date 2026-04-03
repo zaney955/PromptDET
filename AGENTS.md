@@ -15,7 +15,11 @@
 - Because the current `one2one` branch is still anchor-dense, NMS-free inference relies on two mechanisms that must be preserved together:
   - unique assignment during training
   - local peak filtering during inference
-- The score used at inference is a quality-aware combination of objectness and prompt-class confidence.
+- The score used at inference is a quality-aware prompt-conditioned score, not a pure objectness score and not a pure class score.
+- PromptDET currently works best when prompt matching uses both:
+  - category-level global prototypes
+  - category-level detail / token memory
+  Do not collapse matching back to a single local-token `max` path or a closed-set classifier style head.
 
 ## Prompt Conditioning Rules
 - Prompt classes are represented by dynamically aggregated visual prototypes.
@@ -63,6 +67,9 @@
   - contrastive separation
   - class margin / calibration
   instead of adding closed-set shortcuts.
+- Negative supervision for prompt-conditioned scores must suppress all active prompt classes on non-target regions, not only the current max-scoring class.
+- If `joint_score` or related quality-aware scoring losses are modified, keep them aligned with inference scoring semantics. Do not train one notion of quality and decode with another.
+- Context / grounding priors may assist ranking, but they must remain auxiliary. Do not let slot priors become the sole source of class evidence.
 
 ## Inference Rules
 - Detection takes a prompt set built from one or more labeled images.
@@ -75,17 +82,41 @@
 - If a prompt-defined category is absent from the query image, that category's output should be empty.
 - The main inference path should be:
   - decode `one2one`
-  - apply local peak filtering
-  - score
+  - build final prompt-conditioned per-class scores
+  - enforce one-anchor-to-one-prompt-class ownership
+  - apply local peak filtering on those final class-conditional scores
   - threshold
   - top-k
 - Avoid category-wise suppression as a substitute for correct one-to-one learning.
 - NMS is not part of the intended final architecture.
+- Do not use shared `objectness * targetness` peak filtering as the main candidate selector before prompt-class assignment. That design was empirically shown to leak non-prompt objects into active classes.
+- Local peak filtering must operate after prompt-conditioned class ownership is decided, not before.
+- Keep prompt-vs-null gating and class-margin gating in the final inference score. Prompt-conditioned rejection must be part of the main score, not a post-hoc heuristic.
 
 ## Data and Toy Dataset
 - `toy_data` labels must stay consistent with the generated `train.txt`, `val.txt`, `classes.txt`, and `prompt_set.json`.
 - If modifying toy data generation, also update its consistency checks.
 - Example prompt specs must be derived from real label files, never hand-waved placeholders.
+
+## Validated Training Strategy
+- Positive query sampling must not overfit to only clean prompt-target scenes. Hard positives with non-prompt distractor objects are required.
+- Keep a controllable hard-positive sampling path that deliberately includes positive query images containing unrelated labeled objects, so the model learns `detect prompted targets` and `reject non-prompt objects in positive scenes` simultaneously.
+- Negative episodes remain important for empty-set rejection, but they are not sufficient to solve the dominant precision failure mode. Do not rely on negative episodes alone to teach non-prompt rejection.
+- When ranking positive query candidates, coverage of prompt classes and number of prompt instances still matter, but training must also expose the model to cluttered mixed-object scenes.
+
+## Error Analysis Requirements
+- Precision analysis must explicitly separate:
+  - false positives on labeled non-prompt objects
+  - false positives near true prompt targets
+  - false positives on background
+- Do not rely on aggregate precision or `mean_bg_score` alone when diagnosing failures. A low mean background score can still hide severe false positives on a small number of non-prompt objects.
+- Treat `false_positives_on_non_target_object` as a first-class validation signal. This was the dominant failure mode across earlier experiments.
+
+## Known Failure Modes To Avoid
+- Do not regress to a design where any salient object center can be promoted first and only weakly filtered by prompt classes afterward.
+- Do not let context priors paint unrelated objects as active prompt slots without strong prototype evidence.
+- Do not assume removing duplicate predictions is enough. Earlier iterations showed that cross-class duplicates can be reduced while single-class non-prompt false positives remain the main bottleneck.
+- Do not interpret improvements in recall or F1 alone as success if `false_positives_on_non_target_object` remains high.
 
 ## Engineering Expectations
 - Favor changes that improve identifiability, calibration, and prompt-conditioned generalization over cosmetic fixes.
@@ -96,3 +127,4 @@
   - detect entrypoint
   - config defaults
   - documentation/examples
+- When changing prompt-matching, inference scoring, sampling, or evaluator metrics, update this file if the change becomes part of the intended long-term design rather than a temporary ablation.
