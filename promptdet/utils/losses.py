@@ -476,11 +476,7 @@ class PromptDetectionLoss(torch.nn.Module):
                 )
             neg_mask = ~assign.fg_mask
             if neg_mask.any():
-                neg_joint_scores = (
-                    pred_obj[neg_mask]
-                    * pred_tgt[neg_mask]
-                    * pred_prob[neg_mask][:, valid_class_mask].max(dim=-1).values
-                ).clamp(min=0.0)
+                neg_joint_scores = joint_scores[neg_mask].max(dim=-1).values
                 hard_limit = max(
                     self.cfg.null_min_negatives,
                     int(math.ceil(assign.fg_mask.sum().item() * self.cfg.null_neg_pos_ratio)),
@@ -557,8 +553,8 @@ class PromptDetectionLoss(torch.nn.Module):
                     reduction="mean",
                 )
                 total_joint_score = total_joint_score + self.cfg.duplicate_weight * safe_prob_bce(
-                    joint_scores[assign.duplicate_mask].max(dim=-1).values,
-                    torch.zeros_like(pred_objectness[batch_idx][assign.duplicate_mask]),
+                    joint_scores[assign.duplicate_mask],
+                    torch.zeros_like(joint_scores[assign.duplicate_mask]),
                     reduction="mean",
                 )
 
@@ -625,8 +621,8 @@ class PromptDetectionLoss(torch.nn.Module):
                     )
                     total_joint_score = total_joint_score + weighted_mean(
                         safe_prob_bce(
-                            joint_scores[non_target_mask].max(dim=-1).values,
-                            torch.zeros_like(non_target_prompt_logits),
+                            joint_scores[non_target_mask],
+                            torch.zeros_like(joint_scores[non_target_mask]),
                             reduction="none",
                         ),
                         region_weights,
@@ -643,15 +639,11 @@ class PromptDetectionLoss(torch.nn.Module):
                 total_neg += neg_count
                 neg_scores = pred_prob[neg_mask][:, valid_class_mask]
                 if neg_scores.numel() > 0:
-                    neg_joint_scores = (
-                        pred_obj[neg_mask]
-                        * pred_tgt[neg_mask]
-                        * neg_scores.max(dim=-1).values
-                    ).clamp(min=0.0).pow(1.0 / 3.0)
+                    neg_joint_scores = joint_scores[neg_mask].max(dim=-1).values.pow(1.0 / 3.0)
                     total_neg_score_sum = total_neg_score_sum + neg_joint_scores.sum()
                     total_joint_score = total_joint_score + safe_prob_bce(
-                        joint_scores[neg_mask].max(dim=-1).values,
-                        torch.zeros_like(neg_joint_scores),
+                        joint_scores[neg_mask],
+                        torch.zeros_like(joint_scores[neg_mask]),
                         reduction="mean",
                     )
 

@@ -64,6 +64,30 @@ class PromptDET(nn.Module):
     def set_context_prior_strength(self, strength: float) -> None:
         self.context_prior_strength = float(strength)
 
+    @staticmethod
+    def _build_local_peak_mask(
+        flat_scores: torch.Tensor,
+        feature_shapes: list[tuple[int, int]],
+        kernel_size: int,
+    ) -> torch.Tensor:
+        if kernel_size <= 1:
+            return torch.ones_like(flat_scores, dtype=torch.bool)
+        pad = kernel_size // 2
+        level_keep = []
+        start = 0
+        for h, w in feature_shapes:
+            count = h * w
+            score_map = flat_scores[start:start + count].view(1, 1, h, w)
+            peak_mask = F.max_pool2d(
+                score_map,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=pad,
+            ).eq(score_map)
+            level_keep.append(peak_mask.view(-1))
+            start += count
+        return torch.cat(level_keep, dim=0)
+
     def forward(
         self,
         prompt_images: torch.Tensor,
@@ -292,42 +316,34 @@ class PromptDET(nn.Module):
             per_class_boxes = []
             per_class_scores = []
             per_class_labels = []
-            shared_center_scores = (pred_objectness[batch_idx] * pred_targetness[batch_idx]).clamp(min=0.0)
-            if local_peak_kernel > 1:
-                pad = local_peak_kernel // 2
-                level_keep = []
-                start = 0
-                for h, w in feature_shapes:
-                    count = h * w
-                    center_map = shared_center_scores[start:start + count].view(1, 1, h, w)
-                    peak_mask = F.max_pool2d(
-                        center_map,
-                        kernel_size=local_peak_kernel,
-                        stride=1,
-                        padding=pad,
-                    ).eq(center_map)
-                    level_keep.append(peak_mask.view(-1))
-                    start += count
-                shared_keep = torch.cat(level_keep, dim=0)
-            else:
-                shared_keep = torch.ones_like(shared_center_scores, dtype=torch.bool)
-            for class_offset, label in enumerate(valid_class_ids):
-                class_logits = valid_logits[:, class_offset]
-                prompt_vs_null = (class_logits - pred_null_logits[batch_idx]).sigmoid()
-                if valid_logits.shape[1] > 1:
+            prompt_vs_null = (valid_logits - pred_null_logits[batch_idx].unsqueeze(-1)).sigmoid()
+            if valid_logits.shape[1] > 1:
+                competing_logits = []
+                for class_offset in range(valid_logits.shape[1]):
                     class_selector = torch.zeros_like(valid_logits, dtype=torch.bool)
                     class_selector[:, class_offset] = True
-                    competing_logits = valid_logits.masked_fill(class_selector, -1e4).max(dim=1).values
-                    class_margin_gate = (class_logits - competing_logits - 0.2).sigmoid()
-                else:
-                    class_margin_gate = torch.ones_like(prompt_vs_null)
-                base_scores = (
-                    valid_scores[:, class_offset]
-                    * pred_objectness[batch_idx]
-                    * pred_targetness[batch_idx]
-                ).clamp(min=0.0)
-                scores = base_scores * prompt_vs_null.square() * class_margin_gate
-                keep = shared_keep
+                    competing_logits.append(valid_logits.masked_fill(class_selector, -1e4).max(dim=1).values)
+                competing_logits = torch.stack(competing_logits, dim=1)
+                class_margin_gate = (valid_logits - competing_logits - 0.2).sigmoid()
+            else:
+                class_margin_gate = torch.ones_like(prompt_vs_null)
+            score_matrix = (
+                valid_scores
+                * pred_objectness[batch_idx].unsqueeze(-1)
+                * pred_targetness[batch_idx].unsqueeze(-1)
+            ).clamp(min=0.0)
+            score_matrix = score_matrix * prompt_vs_null.square() * class_margin_gate
+            winning_class = score_matrix.argmax(dim=1)
+            for class_offset, label in enumerate(valid_class_ids):
+                class_assignment = winning_class == class_offset
+                if not class_assignment.any():
+                    continue
+                scores = score_matrix[:, class_offset].masked_fill(~class_assignment, 0.0)
+                keep = class_assignment & self._build_local_peak_mask(
+                    scores,
+                    feature_shapes,
+                    local_peak_kernel,
+                )
                 class_boxes = boxes[keep]
                 class_scores_kept = scores[keep]
                 if class_scores_kept.numel() > pre_score_topk:
