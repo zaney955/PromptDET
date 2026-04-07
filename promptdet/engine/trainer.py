@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from contextlib import nullcontext
 from pathlib import Path
+import time
 from typing import Dict
 
 import torch
@@ -30,16 +31,16 @@ def _move_targets(targets, device: torch.device):
     moved = []
     for target in targets:
         moved.append({
-            "boxes": target["boxes"].to(device),
-            "labels": target["labels"].to(device),
-            "category_ids": target["category_ids"].to(device),
-            "dense_slot_target": target["dense_slot_target"].to(device),
-            "dense_fg_target": target["dense_fg_target"].to(device),
-            "dense_center_target": target["dense_center_target"].to(device),
-            "dense_valid_mask": target["dense_valid_mask"].to(device),
-            "query_target_map": target["query_target_map"].to(device),
-            "non_target_boxes": target["non_target_boxes"].to(device),
-            "non_target_weights": target["non_target_weights"].to(device),
+            "boxes": target["boxes"].to(device, non_blocking=True),
+            "labels": target["labels"].to(device, non_blocking=True),
+            "category_ids": target["category_ids"].to(device, non_blocking=True),
+            "dense_slot_target": target["dense_slot_target"].to(device, non_blocking=True),
+            "dense_fg_target": target["dense_fg_target"].to(device, non_blocking=True),
+            "dense_center_target": target["dense_center_target"].to(device, non_blocking=True),
+            "dense_valid_mask": target["dense_valid_mask"].to(device, non_blocking=True),
+            "query_target_map": target["query_target_map"].to(device, non_blocking=True),
+            "non_target_boxes": target["non_target_boxes"].to(device, non_blocking=True),
+            "non_target_weights": target["non_target_weights"].to(device, non_blocking=True),
             "image_size": target["image_size"],
         })
     return moved
@@ -105,6 +106,12 @@ def train(
             "mean_pos_score": 0.0,
             "mean_neg_score": 0.0,
             "mean_matched_iou": 0.0,
+            "time_data": 0.0,
+            "time_h2d": 0.0,
+            "time_forward": 0.0,
+            "time_backward": 0.0,
+            "time_optim": 0.0,
+            "time_step": 0.0,
         }
         if hasattr(model_without_ddp, "set_context_prior_strength"):
             warmup_epochs = max(int(config.train.epochs * config.dense_grounding.prior_warmup_ratio), 1)
@@ -114,17 +121,25 @@ def train(
             else:
                 model_without_ddp.set_context_prior_strength(1.0)
         num_steps = 0
+        step_end_time = time.perf_counter()
         for batch in pbar:
-            prompt_images = batch["prompt_images"].to(device)
-            prompt_boxes = batch["prompt_boxes"].to(device)
-            prompt_hint_maps = batch["prompt_hint_maps"].to(device)
-            prompt_target_maps = batch["prompt_target_maps"].to(device)
-            prompt_class_indices = batch["prompt_class_indices"].to(device)
-            prompt_instance_mask = batch["prompt_instance_mask"].to(device)
-            prompt_class_mask = batch["prompt_class_mask"].to(device)
-            query_image = batch["query_image"].to(device)
-            query_target_map = batch["query_target_map"].to(device)
+            data_time = time.perf_counter() - step_end_time
+            h2d_start = time.perf_counter()
+            prompt_images = batch["prompt_images"].to(device, non_blocking=True)
+            prompt_image_mask = batch["prompt_image_mask"].to(device, non_blocking=True)
+            prompt_boxes = batch["prompt_boxes"].to(device, non_blocking=True)
+            prompt_hint_maps = batch["prompt_hint_maps"].to(device, non_blocking=True)
+            prompt_target_maps = batch["prompt_target_maps"].to(device, non_blocking=True)
+            prompt_class_indices = batch["prompt_class_indices"].to(device, non_blocking=True)
+            prompt_source_indices = batch["prompt_source_indices"].to(device, non_blocking=True)
+            prompt_instance_mask = batch["prompt_instance_mask"].to(device, non_blocking=True)
+            prompt_class_mask = batch["prompt_class_mask"].to(device, non_blocking=True)
+            query_image = batch["query_image"].to(device, non_blocking=True)
+            query_target_map = batch["query_target_map"].to(device, non_blocking=True)
             targets = _move_targets(batch["targets"], device)
+            if device.type == "cuda" and config.train.debug_timing:
+                torch.cuda.synchronize(device)
+            h2d_time = time.perf_counter() - h2d_start
 
             optimizer.zero_grad(set_to_none=True)
             amp_context = (
@@ -132,13 +147,16 @@ def train(
                 if device.type == "cuda"
                 else nullcontext()
             )
+            forward_start = time.perf_counter()
             with amp_context:
                 decoded = model(
                     prompt_images,
+                    prompt_image_mask,
                     prompt_boxes,
                     prompt_hint_maps,
                     prompt_target_maps,
                     prompt_class_indices,
+                    prompt_source_indices,
                     prompt_instance_mask,
                     prompt_class_mask,
                     query_image,
@@ -147,12 +165,20 @@ def train(
                 )
                 losses = loss_fn(decoded, targets)
                 loss = losses["loss"]
+            if device.type == "cuda" and config.train.debug_timing:
+                torch.cuda.synchronize(device)
+            forward_time = time.perf_counter() - forward_start
 
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss detected at epoch={epoch}, step={num_steps}.")
 
+            backward_start = time.perf_counter()
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
+                if device.type == "cuda" and config.train.debug_timing:
+                    torch.cuda.synchronize(device)
+                backward_time = time.perf_counter() - backward_start
+                optim_start = time.perf_counter()
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip) if config.train.grad_clip > 0 else None
                 if grad_norm is not None and not torch.isfinite(grad_norm):
@@ -161,28 +187,55 @@ def train(
                 scaler.update()
             else:
                 loss.backward()
+                if device.type == "cuda" and config.train.debug_timing:
+                    torch.cuda.synchronize(device)
+                backward_time = time.perf_counter() - backward_start
+                optim_start = time.perf_counter()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip) if config.train.grad_clip > 0 else None
                 if grad_norm is not None and not torch.isfinite(grad_norm):
                     raise FloatingPointError(f"Non-finite gradient norm detected at epoch={epoch}, step={num_steps}.")
                 optimizer.step()
+            if device.type == "cuda" and config.train.debug_timing:
+                torch.cuda.synchronize(device)
+            optim_time = time.perf_counter() - optim_start
+            step_time = data_time + h2d_time + forward_time + backward_time + optim_time
 
             for key in epoch_stats:
+                if key.startswith("time_"):
+                    continue
                 epoch_stats[key] += float(losses[key].item())
+            epoch_stats["time_data"] += data_time
+            epoch_stats["time_h2d"] += h2d_time
+            epoch_stats["time_forward"] += forward_time
+            epoch_stats["time_backward"] += backward_time
+            epoch_stats["time_optim"] += optim_time
+            epoch_stats["time_step"] += step_time
             num_steps += 1
-            pbar.set_postfix(
-                loss=f"{float(loss.item()):.4f}",
-                o2m=f"{float(losses['loss_one2many'].item()):.4f}",
-                o2o=f"{float(losses['loss_one2one'].item()):.4f}",
-                obj=f"{float(losses['loss_objectness'].item()):.4f}",
-                tgt=f"{float(losses['loss_targetness'].item()):.4f}",
-                cvs=f"{float(losses['loss_canvas'].item()):.4f}",
-                box=f"{float(losses['loss_box_prior'].item()):.4f}",
-                roi=f"{float(losses['loss_roi_contrast'].item()):.4f}",
-                grd=f"{float(losses['loss_slot'].item() + losses['loss_fg'].item() + losses['loss_center'].item()):.4f}",
-                pos=f"{float(losses['num_pos'].item()):.1f}",
-                ps=f"{float(losses['mean_pos_score'].item()):.3f}",
-                ns=f"{float(losses['mean_neg_score'].item()):.3f}",
-            )
+            postfix = {
+                "loss": f"{float(loss.item()):.4f}",
+                "o2m": f"{float(losses['loss_one2many'].item()):.4f}",
+                "o2o": f"{float(losses['loss_one2one'].item()):.4f}",
+                "obj": f"{float(losses['loss_objectness'].item()):.4f}",
+                "tgt": f"{float(losses['loss_targetness'].item()):.4f}",
+                "cvs": f"{float(losses['loss_canvas'].item()):.4f}",
+                "box": f"{float(losses['loss_box_prior'].item()):.4f}",
+                "roi": f"{float(losses['loss_roi_contrast'].item()):.4f}",
+                "grd": f"{float(losses['loss_slot'].item() + losses['loss_fg'].item() + losses['loss_center'].item()):.4f}",
+                "pos": f"{float(losses['num_pos'].item()):.1f}",
+                "ps": f"{float(losses['mean_pos_score'].item()):.3f}",
+                "ns": f"{float(losses['mean_neg_score'].item()):.3f}",
+            }
+            if config.train.debug_timing:
+                postfix.update({
+                    "dt": f"{data_time:.2f}s",
+                    "h2d": f"{h2d_time:.2f}s",
+                    "fwd": f"{forward_time:.2f}s",
+                    "bwd": f"{backward_time:.2f}s",
+                    "opt": f"{optim_time:.2f}s",
+                    "step": f"{step_time:.2f}s",
+                })
+            pbar.set_postfix(**postfix)
+            step_end_time = time.perf_counter()
 
         scheduler.step()
         reduced_epoch_stats = reduce_dict(epoch_stats, average=False)

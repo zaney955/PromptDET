@@ -84,20 +84,31 @@ class PromptEncoder(nn.Module):
     def forward(
         self,
         prompt_images: torch.Tensor,
+        prompt_source_indices: torch.Tensor,
         prompt_boxes: torch.Tensor,
         prompt_feats: Dict[str, torch.Tensor],
         prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        batch_size, num_instances, _, image_h, image_w = prompt_images.shape
+        batch_size, _, _, image_h, image_w = prompt_images.shape
+        num_instances = prompt_boxes.shape[1]
         if prompt_class_mask.shape[1] > self.max_prompt_classes:
             raise ValueError(
                 f"Batch contains {prompt_class_mask.shape[1]} prompt classes, "
                 f"but model.max_prompt_classes={self.max_prompt_classes}."
             )
 
-        flat_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:])
+        flat_indices = prompt_source_indices.clamp(min=0)
+        gather_index = flat_indices.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(
+            batch_size,
+            num_instances,
+            prompt_images.shape[2],
+            image_h,
+            image_w,
+        )
+        instance_images = torch.gather(prompt_images, dim=1, index=gather_index)
+        flat_images = instance_images.reshape(batch_size * num_instances, *instance_images.shape[2:])
         flat_boxes = prompt_boxes.reshape(batch_size * num_instances, 4)
         crop = crop_and_resize(flat_images, flat_boxes, self.crop_size)
         crop_feat = self.crop_encoder(crop)

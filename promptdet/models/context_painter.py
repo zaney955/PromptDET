@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from promptdet.config import DenseGroundingConfig
 from promptdet.data.prompt_hints import PROMPT_TARGET_CHANNELS
@@ -77,6 +78,7 @@ class PromptContextPainter(nn.Module):
         self.target_segment = nn.Parameter(torch.zeros(1, 1, cfg.dim))
         self.prompt_segment = nn.Parameter(torch.zeros(1, 1, cfg.dim))
         self.query_segment = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        self.use_checkpoint = False
 
         self.blocks = nn.ModuleList([ContextPainterBlock(cfg.dim, cfg.num_heads) for _ in range(cfg.depth)])
         self._init_parameters()
@@ -90,6 +92,9 @@ class PromptContextPainter(nn.Module):
             self.query_segment,
         ):
             nn.init.normal_(parameter, std=0.02)
+
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        self.use_checkpoint = bool(enabled)
 
     def _make_query_mask(
         self,
@@ -200,7 +205,12 @@ class PromptContextPainter(nn.Module):
         pair_mask = prompt_instance_mask.float().view(batch_size, num_instances, 1, 1)
         tokens = tokens * pair_mask
         for layer_idx, block in enumerate(self.blocks):
-            tokens = block(tokens.reshape(batch_size * num_instances, 4 * seq_len, self.dim))
+            flat_tokens = tokens.reshape(batch_size * num_instances, 4 * seq_len, self.dim)
+            if self.training and self.use_checkpoint and flat_tokens.requires_grad:
+                flat_tokens = checkpoint(block, flat_tokens, use_reentrant=False)
+            else:
+                flat_tokens = block(flat_tokens)
+            tokens = flat_tokens
             tokens = tokens.reshape(batch_size, num_instances, 4 * seq_len, self.dim) * pair_mask
             if layer_idx >= self.feature_ensemble_start:
                 prompt_img_seq, query_img_seq, prompt_tgt_seq, query_tgt_seq = torch.split(tokens, seq_len, dim=2)

@@ -52,6 +52,9 @@ class DataConfig:
     val_list: str = ""
     labels_dir: str = ""
     class_names: Dict[str, str] = field(default_factory=dict)
+    resize_cache_enabled: bool = False
+    resize_cache_dir: str = ""
+    resize_cache_workers: int = 4
     min_prompt_classes: int = 1
     max_prompt_classes: int = 3
     max_prompt_instances_per_class: int = 2
@@ -75,6 +78,8 @@ class TrainConfig:
     device: str = "cuda"
     seed: int = 42
     mixed_precision: bool = True
+    activation_checkpointing: bool = True
+    debug_timing: bool = False
     grad_clip: float = 5.0
     score_threshold: float = 0.15
     pre_score_topk: int = 256

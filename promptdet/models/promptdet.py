@@ -60,6 +60,7 @@ class PromptDET(nn.Module):
         self.context_prior_strength = 1.0
         self.slot_prior_logit_scale = nn.Parameter(torch.tensor(1.0))
         self._register_ddp_grad_layout_hooks()
+        self.set_activation_checkpointing(False)
 
     def _register_ddp_grad_layout_hooks(self) -> None:
         # Some conv weights fed by heavy reshape/permute paths can produce
@@ -83,6 +84,10 @@ class PromptDET(nn.Module):
 
     def set_context_prior_strength(self, strength: float) -> None:
         self.context_prior_strength = float(strength)
+
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        self.prompt_fusion.set_activation_checkpointing(enabled)
+        self.grounder.set_activation_checkpointing(enabled)
 
     @staticmethod
     def _build_local_peak_mask(
@@ -111,27 +116,29 @@ class PromptDET(nn.Module):
     def forward(
         self,
         prompt_images: torch.Tensor,
+        prompt_image_mask: torch.Tensor,
         prompt_boxes: torch.Tensor,
         prompt_hint_maps: torch.Tensor,
         prompt_target_maps: torch.Tensor,
         prompt_class_indices: torch.Tensor,
+        prompt_source_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
         query_image: torch.Tensor,
         query_target_map: torch.Tensor | None = None,
         decode: bool = False,
     ) -> Dict[str, Dict[str, List[torch.Tensor]]] | Dict[str, Dict[str, torch.Tensor]]:
-        batch_size, num_instances = prompt_images.shape[:2]
-        flat_prompt_images = prompt_images.reshape(batch_size * num_instances, *prompt_images.shape[2:]).contiguous()
         query_image = query_image.contiguous()
-        flat_prompt_feats = self.neck(self.backbone(flat_prompt_images))
-        prompt_feats = {
-            name: feat.view(batch_size, num_instances, *feat.shape[1:])
-            for name, feat in flat_prompt_feats.items()
-        }
+        prompt_feats = self._encode_prompt_images_once(
+            prompt_images,
+            prompt_image_mask,
+            prompt_source_indices,
+            prompt_boxes.shape[1],
+        )
         query_feats = self.neck(self.backbone(query_image))
         prompt_encoding = self.prompt_encoder(
             prompt_images,
+            prompt_source_indices,
             prompt_boxes,
             prompt_feats,
             prompt_class_indices,
@@ -175,6 +182,40 @@ class PromptDET(nn.Module):
         if decode:
             return self.decode_raw(branches)
         return branches
+
+    def _encode_prompt_images_once(
+        self,
+        prompt_images: torch.Tensor,
+        prompt_image_mask: torch.Tensor,
+        prompt_source_indices: torch.Tensor,
+        num_instances: int,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size, max_prompt_images = prompt_images.shape[:2]
+        unique_prompt_images = []
+        image_counts = []
+        for batch_idx in range(batch_size):
+            valid_image_indices = torch.nonzero(prompt_image_mask[batch_idx], as_tuple=False).squeeze(1)
+            if valid_image_indices.numel() == 0:
+                image_counts.append(0)
+                continue
+            unique_prompt_images.append(prompt_images[batch_idx, valid_image_indices])
+            image_counts.append(int(valid_image_indices.numel()))
+
+        flat_unique_prompt_images = torch.cat(unique_prompt_images, dim=0).contiguous()
+        unique_prompt_feats = self.neck(self.backbone(flat_unique_prompt_images))
+        prompt_feats = {}
+        start = 0
+        for name, unique_feat in unique_prompt_feats.items():
+            feat_shape = unique_feat.shape[1:]
+            prompt_feats[name] = unique_feat.new_zeros((batch_size, num_instances, *feat_shape))
+        for batch_idx, image_count in enumerate(image_counts):
+            if image_count == 0:
+                continue
+            source_indices = prompt_source_indices[batch_idx].clamp(min=0)
+            for name, unique_feat in unique_prompt_feats.items():
+                prompt_feats[name][batch_idx] = unique_feat[start:start + image_count][source_indices]
+            start += image_count
+        return prompt_feats
 
     def _decode_branch(self, outputs: Dict[str, List[torch.Tensor]]) -> Dict[str, torch.Tensor]:
         box_logits = outputs["box_logits"]

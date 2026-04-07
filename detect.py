@@ -97,14 +97,20 @@ def _load_prompt_set(
     prompt_hint_maps = []
     prompt_target_maps = []
     prompt_class_indices = []
+    prompt_source_indices = []
     label_to_slot = {}
+    image_path_to_source_index = {}
 
     for prompt in prompts:
         prompt_image_path = Path(prompt["image"])
         if not prompt_image_path.is_absolute() and prompt_spec_path is not None:
             prompt_image_path = (prompt_spec_path.parent / prompt_image_path).resolve()
         prompt_image = Image.open(prompt_image_path).convert("RGB")
-        resized = resize_image(prompt_image, image_size)
+        prompt_source_index = image_path_to_source_index.get(str(prompt_image_path))
+        if prompt_source_index is None:
+            prompt_source_index = len(prompt_images)
+            image_path_to_source_index[str(prompt_image_path)] = prompt_source_index
+            prompt_images.append(resize_image(prompt_image, image_size))
         for ann in prompt["annotations"]:
             label = int(ann["label"])
             bbox_raw = ann["bbox"]
@@ -121,7 +127,6 @@ def _load_prompt_set(
             )[0]
             bbox[0::2] *= image_size / prompt_image.size[0]
             bbox[1::2] *= image_size / prompt_image.size[1]
-            prompt_images.append(resized)
             prompt_boxes.append(bbox)
             hint = build_prompt_hint_map(
                 image_size,
@@ -131,8 +136,9 @@ def _load_prompt_set(
             )
             prompt_hint_maps.append(hint)
             prompt_class_indices.append(slot)
+            prompt_source_indices.append(prompt_source_index)
 
-    if not prompt_images:
+    if not prompt_boxes:
         raise ValueError("Prompt set is empty.")
     if len(label_to_slot) > max_prompt_classes:
         raise ValueError("Prompt set exceeds model.max_prompt_classes.")
@@ -154,11 +160,13 @@ def _load_prompt_set(
 
     return {
         "prompt_images": torch.stack(prompt_images, dim=0).unsqueeze(0),
+        "prompt_image_mask": torch.ones((1, len(prompt_images)), dtype=torch.bool),
         "prompt_boxes": torch.stack(prompt_boxes, dim=0).unsqueeze(0),
         "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0).unsqueeze(0),
         "prompt_target_maps": torch.stack(prompt_target_maps, dim=0).unsqueeze(0),
         "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long).unsqueeze(0),
-        "prompt_instance_mask": torch.ones((1, len(prompt_images)), dtype=torch.bool),
+        "prompt_source_indices": torch.tensor(prompt_source_indices, dtype=torch.long).unsqueeze(0),
+        "prompt_instance_mask": torch.ones((1, len(prompt_boxes)), dtype=torch.bool),
         "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long).unsqueeze(0),
         "prompt_class_mask": torch.ones((1, len(prompt_class_ids)), dtype=torch.bool),
         "slot_colors": slot_colors.unsqueeze(0),
@@ -183,10 +191,12 @@ def _run_single_query(
     with torch.no_grad():
         raw = model(
             prompt_batch["prompt_images"].to(device),
+            prompt_batch["prompt_image_mask"].to(device),
             prompt_batch["prompt_boxes"].to(device),
             prompt_batch["prompt_hint_maps"].to(device),
             prompt_batch["prompt_target_maps"].to(device),
             prompt_batch["prompt_class_indices"].to(device),
+            prompt_batch["prompt_source_indices"].to(device),
             prompt_batch["prompt_instance_mask"].to(device),
             prompt_batch["prompt_class_mask"].to(device),
             query_tensor,

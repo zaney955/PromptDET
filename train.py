@@ -4,12 +4,15 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from promptdet.config import load_config, save_config
 from promptdet.data.episodic import PromptEpisodeDataset, collate_episodes
+from promptdet.data.resize_cache import ensure_resize_cache
+from promptdet.data.yolo_io import load_image_list
 from promptdet.engine.trainer import train
 from promptdet.models.promptdet import PromptDET
 from promptdet.utils.losses import PromptDetectionLoss
@@ -56,6 +59,30 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         save_config(output_dir / "config.json", config)
 
+    resize_cache_dir = None
+    if config.data.resize_cache_enabled:
+        resize_cache_dir = config.data.resize_cache_dir or str((output_dir / "resize_cache").resolve())
+        if is_main_process():
+            cache_image_paths = load_image_list(config.data.train_list) + load_image_list(config.data.val_list)
+            cache_summary = ensure_resize_cache(
+                image_paths=cache_image_paths,
+                image_size=config.model.image_size,
+                cache_dir=resize_cache_dir,
+                num_workers=config.data.resize_cache_workers,
+            )
+            print(
+                "Resize cache ready:",
+                f"total={cache_summary['total']}",
+                f"updated={cache_summary['updated']}",
+                f"skipped={cache_summary['skipped']}",
+                f"dir={resize_cache_dir}",
+            )
+        if dist_info["distributed"] and dist.is_initialized():
+            if device.type == "cuda":
+                dist.barrier(device_ids=[dist_info["local_rank"]])
+            else:
+                dist.barrier()
+
     train_dataset = PromptEpisodeDataset(
         image_list_path=config.data.train_list,
         labels_dir=config.data.labels_dir,
@@ -73,6 +100,7 @@ def main():
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
         hard_positive_ratio=config.data.hard_positive_ratio,
         positive_query_shortlist=config.data.positive_query_shortlist,
+        resize_cache_dir=resize_cache_dir,
         seed=None,
     )
     val_dataset = PromptEpisodeDataset(
@@ -92,6 +120,7 @@ def main():
         hint_bg_expand=config.dense_grounding.hint_bg_expand,
         hard_positive_ratio=config.data.hard_positive_ratio,
         positive_query_shortlist=config.data.positive_query_shortlist,
+        resize_cache_dir=resize_cache_dir,
         seed=config.train.seed + 100_000,
     )
 
@@ -106,6 +135,8 @@ def main():
         num_workers=config.data.num_workers,
         collate_fn=collate_episodes,
         pin_memory=device.type == "cuda",
+        persistent_workers=config.data.num_workers > 0,
+        prefetch_factor=2 if config.data.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -115,9 +146,14 @@ def main():
         num_workers=config.data.num_workers,
         collate_fn=collate_episodes,
         pin_memory=device.type == "cuda",
+        persistent_workers=config.data.num_workers > 0,
+        prefetch_factor=2 if config.data.num_workers > 0 else None,
     )
 
-    model = PromptDET(config.model, config.dense_grounding).to(device)
+    model = PromptDET(config.model, config.dense_grounding)
+    if hasattr(model, "set_activation_checkpointing"):
+        model.set_activation_checkpointing(config.train.activation_checkpointing)
+    model = model.to(device)
     if dist_info["distributed"]:
         ddp_kwargs = {"broadcast_buffers": False}
         if device.type == "cuda":

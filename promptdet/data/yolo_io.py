@@ -5,6 +5,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 
 def load_class_names(path: str | Path) -> dict[int, str]:
     names = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]

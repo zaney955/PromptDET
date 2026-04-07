@@ -27,3 +27,5 @@ toy_data_validation/
 .vscode/
 
 message.local
+
+cache/

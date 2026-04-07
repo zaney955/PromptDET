@@ -40,6 +40,9 @@ class BBoxPromptGrounder(nn.Module):
         self.hint_proj = nn.Conv2d(3, channels, 1)
         self.box_embed = nn.Linear(4, channels)
 
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        self.painter.set_activation_checkpointing(enabled)
+
     def _build_priors(
         self,
         slot_logits: torch.Tensor,

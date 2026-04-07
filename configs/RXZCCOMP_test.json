@@ -21,6 +21,9 @@
     "train_list": "/media/yzy/TogeeWork/sync/yzy_win_datas/Shanghai4C/RXZCCOMP/txtpath_4090_server/train.txt",
     "val_list": "/media/yzy/TogeeWork/sync/yzy_win_datas/Shanghai4C/RXZCCOMP/txtpath_4090_server/val.txt",
     "labels_dir": "/media/yzy/TogeeWork/sync/yzy_win_datas/Shanghai4C/RXZCCOMP/labels/",
+    "resize_cache_enabled": true,
+    "resize_cache_dir": "./cache/RXZCCOMP_test",
+    "resize_cache_workers": 4,
     "class_names": {
       "0": "C_BP",
       "1": "C_BPLJ",
@@ -53,17 +56,19 @@
     "positive_query_shortlist": 6,
     "episodes_per_epoch": 1000,
     "val_episodes": 200,
-    "num_workers": 2
+    "num_workers": 1
   },
   "train": {
     "output_dir": "./outputs/RXZCCOMP_test/exp1",
     "device": "cuda",
-    "batch_size": 8,
-    "epochs": 100,
+    "batch_size": 1,
+    "epochs": 200,
     "lr": 0.0003,
     "weight_decay": 0.0001,
     "warmup_epochs": 2,
     "mixed_precision": true,
+    "activation_checkpointing": true,
+    "debug_timing": true,
     "grad_clip": 5.0,
     "score_threshold": 0.2,
     "pre_score_topk": 256,

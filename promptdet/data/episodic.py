@@ -17,15 +17,20 @@ from promptdet.data.prompt_hints import (
     build_query_detection_targets,
     sample_slot_colors,
 )
+from promptdet.data.resize_cache import get_resize_cache_paths
 from promptdet.data.yolo_io import imread_rgb, load_image_list, parse_yolo_label_file, probe_image_size
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 
-DEFAULT_IMAGE_CACHE_SIZE = 128
+DEFAULT_RESIZED_IMAGE_CACHE_SIZE = 32
 
 
 def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
     array = image.astype(np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1)
+
+
+def _numpy_to_uint8_chw_tensor(image: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).contiguous()
 
 
 def resize_image_and_boxes(image: np.ndarray, boxes: torch.Tensor, size: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -64,6 +69,7 @@ class PromptEpisodeDataset(Dataset):
         hint_bg_expand: float = 0.12,
         hard_positive_ratio: float = 0.5,
         positive_query_shortlist: int = 6,
+        resize_cache_dir: str | None = None,
         seed: int | None = None,
     ):
         super().__init__()
@@ -81,10 +87,11 @@ class PromptEpisodeDataset(Dataset):
         self.hint_bg_expand = hint_bg_expand
         self.hard_positive_ratio = hard_positive_ratio
         self.positive_query_shortlist = positive_query_shortlist
+        self.resize_cache_dir = Path(resize_cache_dir).expanduser().resolve() if resize_cache_dir else None
         self.seed = seed
         self.label_paths_by_stem = {}
-        self.image_cache: OrderedDict[int, np.ndarray] = OrderedDict()
-        self.image_cache_size = DEFAULT_IMAGE_CACHE_SIZE
+        self.resized_tensor_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self.resized_tensor_cache_size = DEFAULT_RESIZED_IMAGE_CACHE_SIZE
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -133,18 +140,37 @@ class PromptEpisodeDataset(Dataset):
     def __len__(self) -> int:
         return self.episodes_per_epoch
 
-    def _load_image(self, image_id: int) -> np.ndarray:
-        cached = self.image_cache.get(image_id)
+    def _resize_boxes_for_image(self, boxes: torch.Tensor, image_id: int) -> torch.Tensor:
+        boxes = boxes.clone().float()
+        if boxes.numel() == 0:
+            return boxes
+        image_record = self.image_records[image_id]
+        boxes[:, 0::2] *= self.image_size / max(float(image_record["width"]), 1.0)
+        boxes[:, 1::2] *= self.image_size / max(float(image_record["height"]), 1.0)
+        return boxes
+
+    def _load_resized_image_tensor(self, image_id: int) -> torch.Tensor:
+        cached = self.resized_tensor_cache.get(image_id)
         if cached is not None:
-            self.image_cache.move_to_end(image_id)
-            return cached
-        path = Path(self.image_records[image_id]["path"])
-        image = imread_rgb(path)
-        self.image_cache[image_id] = image
-        self.image_cache.move_to_end(image_id)
-        if len(self.image_cache) > self.image_cache_size:
-            self.image_cache.popitem(last=False)
-        return image
+            self.resized_tensor_cache.move_to_end(image_id)
+            return cached.float().div(255.0)
+        path = Path(self.image_records[image_id]["path"]).resolve()
+        if self.resize_cache_dir is not None:
+            cache_path, _ = get_resize_cache_paths(self.resize_cache_dir, path, self.image_size)
+            if cache_path.exists():
+                resized = np.load(cache_path, allow_pickle=False)
+            else:
+                image = imread_rgb(path)
+                resized = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        else:
+            image = imread_rgb(path)
+            resized = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        image_tensor = _numpy_to_uint8_chw_tensor(resized)
+        self.resized_tensor_cache[image_id] = image_tensor
+        self.resized_tensor_cache.move_to_end(image_id)
+        if len(self.resized_tensor_cache) > self.resized_tensor_cache_size:
+            self.resized_tensor_cache.popitem(last=False)
+        return image_tensor.float().div(255.0)
 
     def _sample_prompt_classes(self, rng: random.Random) -> List[int]:
         max_classes = min(self.max_prompt_classes, len(self.classes))
@@ -329,22 +355,27 @@ class PromptEpisodeDataset(Dataset):
             min_distance=self.color_min_distance,
             generator=color_generator,
         )
+        prompt_image_id_to_index: Dict[int, int] = {}
         prompt_images = []
         prompt_boxes = []
         prompt_hint_maps = []
         prompt_target_maps = []
         prompt_class_indices = []
+        prompt_source_indices = []
         for instance in prompt_instances:
-            image = self._load_image(instance["image_id"])
+            source_index = prompt_image_id_to_index.get(instance["image_id"])
+            if source_index is None:
+                source_index = len(prompt_images)
+                prompt_image_id_to_index[int(instance["image_id"])] = source_index
+                prompt_images.append(self._load_resized_image_tensor(instance["image_id"]))
             box = torch.tensor([instance["bbox"]], dtype=torch.float32)
-            image_tensor, box = resize_image_and_boxes(image, box, self.image_size)
+            box = self._resize_boxes_for_image(box, instance["image_id"])
             hint = build_prompt_hint_map(
                 self.image_size,
                 box[0],
                 inner_shrink=self.hint_inner_shrink,
                 bg_expand=self.hint_bg_expand,
             )
-            prompt_images.append(image_tensor)
             prompt_boxes.append(box[0])
             prompt_hint_maps.append(hint)
             prompt_target_maps.append(
@@ -357,8 +388,8 @@ class PromptEpisodeDataset(Dataset):
                 )
             )
             prompt_class_indices.append(instance["class_slot"])
+            prompt_source_indices.append(source_index)
 
-        query_image = self._load_image(query_image_id)
         query_anns = self.image_to_anns[query_image_id]
         query_boxes = []
         query_labels = []
@@ -391,8 +422,9 @@ class PromptEpisodeDataset(Dataset):
             non_target_boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
             non_target_weights_tensor = torch.zeros((0,), dtype=torch.float32)
 
-        query_image_tensor, query_boxes_tensor = resize_image_and_boxes(query_image, query_boxes_tensor, self.image_size)
-        _, non_target_boxes_tensor = resize_image_and_boxes(query_image, non_target_boxes_tensor, self.image_size)
+        query_image_tensor = self._load_resized_image_tensor(query_image_id)
+        query_boxes_tensor = self._resize_boxes_for_image(query_boxes_tensor, query_image_id)
+        non_target_boxes_tensor = self._resize_boxes_for_image(non_target_boxes_tensor, query_image_id)
         query_dense_slot_target, query_dense_fg_target, query_dense_center_target, query_dense_valid_mask, query_target_map = build_query_detection_targets(
             self.image_size,
             query_boxes_tensor,
@@ -407,6 +439,7 @@ class PromptEpisodeDataset(Dataset):
             "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0),
             "prompt_target_maps": torch.stack(prompt_target_maps, dim=0),
             "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long),
+            "prompt_source_indices": torch.tensor(prompt_source_indices, dtype=torch.long),
             "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long),
             "slot_colors": slot_colors,
             "query_image": query_image_tensor,
@@ -427,10 +460,12 @@ class PromptEpisodeDataset(Dataset):
 
 def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor | List[Dict[str, torch.Tensor]]]:
     batch_size = len(batch)
-    max_prompt_instances = max(item["prompt_images"].shape[0] for item in batch)
+    max_prompt_instances = max(item["prompt_boxes"].shape[0] for item in batch)
+    max_prompt_images = max(item["prompt_images"].shape[0] for item in batch)
     max_prompt_classes = max(item["prompt_class_ids"].shape[0] for item in batch)
     channels, height, width = batch[0]["query_image"].shape
-    prompt_images = torch.zeros((batch_size, max_prompt_instances, channels, height, width), dtype=torch.float32)
+    prompt_images = torch.zeros((batch_size, max_prompt_images, channels, height, width), dtype=torch.float32)
+    prompt_image_mask = torch.zeros((batch_size, max_prompt_images), dtype=torch.bool)
     prompt_boxes = torch.zeros((batch_size, max_prompt_instances, 4), dtype=torch.float32)
     prompt_hint_maps = torch.zeros((batch_size, max_prompt_instances, 3, height, width), dtype=torch.float32)
     prompt_target_maps = torch.zeros(
@@ -438,19 +473,23 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         dtype=torch.float32,
     )
     prompt_class_indices = torch.zeros((batch_size, max_prompt_instances), dtype=torch.long)
+    prompt_source_indices = torch.full((batch_size, max_prompt_instances), -1, dtype=torch.long)
     prompt_instance_mask = torch.zeros((batch_size, max_prompt_instances), dtype=torch.bool)
     prompt_class_ids = torch.full((batch_size, max_prompt_classes), -1, dtype=torch.long)
     prompt_class_mask = torch.zeros((batch_size, max_prompt_classes), dtype=torch.bool)
     slot_colors = torch.zeros((batch_size, max_prompt_classes, 3), dtype=torch.float32)
 
     for batch_idx, item in enumerate(batch):
-        num_instances = item["prompt_images"].shape[0]
+        num_instances = item["prompt_boxes"].shape[0]
+        num_prompt_images = item["prompt_images"].shape[0]
         num_classes = item["prompt_class_ids"].shape[0]
-        prompt_images[batch_idx, :num_instances] = item["prompt_images"]
+        prompt_images[batch_idx, :num_prompt_images] = item["prompt_images"]
+        prompt_image_mask[batch_idx, :num_prompt_images] = True
         prompt_boxes[batch_idx, :num_instances] = item["prompt_boxes"]
         prompt_hint_maps[batch_idx, :num_instances] = item["prompt_hint_maps"]
         prompt_target_maps[batch_idx, :num_instances] = item["prompt_target_maps"]
         prompt_class_indices[batch_idx, :num_instances] = item["prompt_class_indices"]
+        prompt_source_indices[batch_idx, :num_instances] = item["prompt_source_indices"]
         prompt_instance_mask[batch_idx, :num_instances] = True
         prompt_class_ids[batch_idx, :num_classes] = item["prompt_class_ids"]
         prompt_class_mask[batch_idx, :num_classes] = True
@@ -458,10 +497,12 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
 
     return {
         "prompt_images": prompt_images,
+        "prompt_image_mask": prompt_image_mask,
         "prompt_boxes": prompt_boxes,
         "prompt_hint_maps": prompt_hint_maps,
         "prompt_target_maps": prompt_target_maps,
         "prompt_class_indices": prompt_class_indices,
+        "prompt_source_indices": prompt_source_indices,
         "prompt_instance_mask": prompt_instance_mask,
         "prompt_class_ids": prompt_class_ids,
         "prompt_class_mask": prompt_class_mask,

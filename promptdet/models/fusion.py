@@ -5,6 +5,7 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .common import ConvBNAct, MLP
 
@@ -23,6 +24,7 @@ class PromptQueryFusionBlock(nn.Module):
         self.null_scale_token = nn.Parameter(torch.randn(1, channels))
         self.class_refine = ConvBNAct(channels + 2, channels, 3)
         self.refine = ConvBNAct(channels + 6, channels, 3)
+        self.use_checkpoint = False
 
     @staticmethod
     def _aggregate_instance_scores(
@@ -38,7 +40,7 @@ class PromptQueryFusionBlock(nn.Module):
         class_scores = torch.einsum("bni,bik->bnk", instance_scores, class_assign)
         return class_scores / class_counts.unsqueeze(1)
 
-    def forward(
+    def _forward_impl(
         self,
         x: torch.Tensor,
         prompt_tokens: torch.Tensor,
@@ -159,6 +161,47 @@ class PromptQueryFusionBlock(nn.Module):
         class_feat = class_feat * class_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).float()
         return shared_feat, class_feat
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        class_prototypes: torch.Tensor,
+        class_mask: torch.Tensor,
+        scale_tokens: torch.Tensor,
+        instance_prototypes: torch.Tensor,
+        instance_class_indices: torch.Tensor,
+        instance_mask: torch.Tensor,
+        instance_scale_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training and self.use_checkpoint and x.requires_grad:
+            return checkpoint(
+                self._forward_impl,
+                x,
+                prompt_tokens,
+                prompt_mask,
+                class_prototypes,
+                class_mask,
+                scale_tokens,
+                instance_prototypes,
+                instance_class_indices,
+                instance_mask,
+                instance_scale_tokens,
+                use_reentrant=False,
+            )
+        return self._forward_impl(
+            x,
+            prompt_tokens,
+            prompt_mask,
+            class_prototypes,
+            class_mask,
+            scale_tokens,
+            instance_prototypes,
+            instance_class_indices,
+            instance_mask,
+            instance_scale_tokens,
+        )
+
 
 class PromptFusionNeck(nn.Module):
     def __init__(self, channels: int, prompt_dim: int, num_heads: int):
@@ -168,6 +211,10 @@ class PromptFusionNeck(nn.Module):
             "p4": PromptQueryFusionBlock(channels, prompt_dim, num_heads),
             "p5": PromptQueryFusionBlock(channels, prompt_dim, num_heads),
         })
+
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        for block in self.blocks.values():
+            block.use_checkpoint = bool(enabled)
 
     def forward(self, feats: Dict[str, torch.Tensor], prompt: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
         shared_outputs = {}
