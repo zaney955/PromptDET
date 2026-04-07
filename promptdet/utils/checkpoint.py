@@ -13,6 +13,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
+    scaler: Optional[Any] = None,
     epoch: int = 0,
     best_score: float = 0.0,
     extra: Optional[Dict[str, Any]] = None,
@@ -27,6 +28,8 @@ def save_checkpoint(
         payload["optimizer"] = optimizer.state_dict()
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler"] = scaler.state_dict()
     if extra:
         payload["extra"] = extra
     path = Path(path)
@@ -39,6 +42,7 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
+    scaler: Optional[Any] = None,
     map_location: str = "cpu",
 ) -> Dict[str, Any]:
     try:
@@ -60,4 +64,6 @@ def load_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and "scheduler" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler"])
+    if scaler is not None and "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
     return checkpoint

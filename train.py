@@ -22,6 +22,13 @@ from promptdet.utils.misc import cleanup_distributed, is_main_process, set_seed,
 def parse_args():
     parser = argparse.ArgumentParser(description="Train PromptDET.")
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config.")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Resume training from a checkpoint. Pass a path, or omit the value to use output_dir/last.pt.",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int, default=None)
     return parser.parse_args()
@@ -29,7 +36,27 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = load_config(args.config)
+    config_path = args.config
+    resume_arg = args.resume
+    if config_path is None and resume_arg and resume_arg != "auto":
+        resume_config = Path(resume_arg).expanduser().resolve().parent / "config.json"
+        if resume_config.exists():
+            config_path = str(resume_config)
+        else:
+            raise FileNotFoundError(
+                f"--resume was provided but no --config was given, and {resume_config} does not exist."
+            )
+    if config_path is None and resume_arg == "auto":
+        raise ValueError("--resume without a checkpoint path requires --config so output_dir can be resolved.")
+    config = load_config(config_path)
+    if resume_arg:
+        if resume_arg == "auto":
+            auto_resume = Path(config.train.output_dir).expanduser().resolve() / "last.pt"
+            if not auto_resume.exists():
+                raise FileNotFoundError(f"--resume requested automatic recovery, but {auto_resume} does not exist.")
+            config.train.resume = str(auto_resume)
+        else:
+            config.train.resume = resume_arg
     if args.device:
         config.train.device = args.device
 

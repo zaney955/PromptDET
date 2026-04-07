@@ -2,7 +2,7 @@
   "model": {
     "image_size": 640,
     "max_prompt_classes": 20,
-    "prompt_crop_size": 128,
+    "prompt_crop_size": 256,
     "neck_channels": 192,
     "prompt_dim": 256,
     "reg_max": 16,
@@ -47,11 +47,11 @@
       "19": "C_ZCLJ",
       "20": "C_ZZBG"
     },
-    "max_prompt_classes": 10,
+    "max_prompt_classes": 5,
     "min_prompt_classes": 1,
     "max_prompt_instances_per_class": 4,
     "max_prompt_images": 4,
-    "negative_episode_ratio": 0.6,
+    "negative_episode_ratio": 0.25,
     "hard_positive_ratio": 0.5,
     "positive_query_shortlist": 6,
     "episodes_per_epoch": 1000,
@@ -59,7 +59,7 @@
     "num_workers": 1
   },
   "train": {
-    "output_dir": "./outputs/RXZCCOMP_test/exp1",
+    "output_dir": "./outputs/RXZCCOMP_test/exp2",
     "device": "cuda",
     "batch_size": 1,
     "epochs": 200,

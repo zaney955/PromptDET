@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
+import json
 from pathlib import Path
 import time
 from typing import Dict
@@ -73,13 +74,29 @@ def train(
     scheduler = _make_scheduler(optimizer, config.train.epochs, config.train.warmup_epochs)
     start_epoch = 0
     best_f1 = 0.0
+    history = []
 
     if config.train.resume:
-        checkpoint = load_checkpoint(config.train.resume, model_without_ddp, optimizer=optimizer, scheduler=scheduler, map_location=device.type)
+        checkpoint = load_checkpoint(
+            config.train.resume,
+            model_without_ddp,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            map_location=device.type,
+        )
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_f1 = float(checkpoint.get("best_score", 0.0))
-
-    history = []
+        history_path = output_dir / "history.json"
+        if history_path.exists():
+            history_payload = json.loads(history_path.read_text(encoding="utf-8"))
+            history = list(history_payload.get("history", []))
+        else:
+            extra = checkpoint.get("extra")
+            if isinstance(extra, dict):
+                history = [extra]
+        if is_main_process():
+            print(f"Resumed from {config.train.resume} at epoch {start_epoch} with best_f1={best_f1:.6f}")
     for epoch in range(start_epoch, config.train.epochs):
         model.train()
         if isinstance(train_loader.sampler, DistributedSampler):
@@ -261,13 +278,31 @@ def train(
             summary.update({f"val_{key}": value for key, value in val_metrics.items()})
             if val_metrics["f1"] >= best_f1 and is_main_process():
                 best_f1 = val_metrics["f1"]
-                save_checkpoint(output_dir / "best.pt", model_without_ddp, optimizer, scheduler, epoch=epoch, best_score=best_f1, extra=summary)
+                save_checkpoint(
+                    output_dir / "best.pt",
+                    model_without_ddp,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch=epoch,
+                    best_score=best_f1,
+                    extra=summary,
+                )
             best_f1 = max(best_f1, val_metrics["f1"])
 
         if is_main_process():
             history.append(summary)
             if (epoch + 1) % config.train.save_interval == 0:
-                save_checkpoint(output_dir / "last.pt", model_without_ddp, optimizer, scheduler, epoch=epoch, best_score=best_f1, extra=summary)
+                save_checkpoint(
+                    output_dir / "last.pt",
+                    model_without_ddp,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch=epoch,
+                    best_score=best_f1,
+                    extra=summary,
+                )
             save_json(output_dir / "history.json", {"history": history, "best_f1": best_f1})
 
     return {"best_f1": best_f1}
