@@ -4,18 +4,18 @@ import argparse
 import json
 from pathlib import Path
 
-import cv2
 import numpy as np
 from PIL import Image
 import torch
 
 from promptdet.config import load_config
+from promptdet.data.letterbox import compute_letterbox_params, letterbox_boxes, letterbox_image, unletterbox_boxes
 from promptdet.data.prompt_hints import (
     build_prompt_hint_map,
     build_prompt_target_map,
     sample_slot_colors,
 )
-from promptdet.data.resize_cache import get_resize_cache_paths
+from promptdet.data.resize_cache import get_resize_cache_paths, is_resize_cache_stale
 from promptdet.data.yolo_io import imread_rgb
 from promptdet.models.promptdet import PromptDET
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
@@ -32,10 +32,11 @@ def _load_resized_rgb(path: Path, size: int, resize_cache_dir: Path | None) -> n
     resolved_path = path.resolve()
     if resize_cache_dir is not None:
         cache_path, _ = get_resize_cache_paths(resize_cache_dir, resolved_path, size)
-        if cache_path.exists():
+        if cache_path.exists() and not is_resize_cache_stale(resize_cache_dir, resolved_path, size):
             return np.load(cache_path, allow_pickle=False)
     image = imread_rgb(resolved_path)
-    return cv2.resize(image, (size, size), interpolation=cv2.INTER_LINEAR)
+    resized, _ = letterbox_image(image, size)
+    return resized
 
 
 def _load_original_and_resized(path: Path, size: int, resize_cache_dir: Path | None) -> tuple[np.ndarray, torch.Tensor]:
@@ -194,8 +195,10 @@ def _load_prompt_set(
                 int(prompt_image.shape[1]),
                 int(prompt_image.shape[0]),
             )[0]
-            bbox[0::2] *= image_size / max(int(prompt_image.shape[1]), 1)
-            bbox[1::2] *= image_size / max(int(prompt_image.shape[0]), 1)
+            bbox = letterbox_boxes(
+                bbox.unsqueeze(0),
+                compute_letterbox_params(int(prompt_image.shape[1]), int(prompt_image.shape[0]), image_size),
+            )[0]
             prompt_boxes.append(bbox)
             hint = build_prompt_hint_map(
                 image_size,
@@ -285,10 +288,10 @@ def _run_single_query(
             max_detections=max_detections,
         )[0]
 
-    boxes = preds["boxes"].cpu()
-    boxes[:, 0::2] *= query_pil.size[0] / image_size
-    boxes[:, 1::2] *= query_pil.size[1] / image_size
-    preds["boxes"] = boxes
+    preds["boxes"] = unletterbox_boxes(
+        preds["boxes"].cpu(),
+        compute_letterbox_params(query_pil.size[0], query_pil.size[1], image_size),
+    )
     return query_pil, preds, raw.get("context_aux")
 
 

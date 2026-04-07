@@ -7,12 +7,12 @@ import os
 from pathlib import Path
 from typing import Iterable
 
-import cv2
 import numpy as np
 
+from .letterbox import letterbox_image
 from .yolo_io import imread_rgb
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _normalize_cache_root(cache_dir: str | Path, image_size: int) -> Path:
@@ -65,7 +65,7 @@ def _write_resize_cache(cache_dir: str | Path, image_path: str | Path, image_siz
     cache_path, meta_path = get_resize_cache_paths(cache_dir, image_path, image_size)
     existed = cache_path.exists() and meta_path.exists()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    resized = cv2.resize(imread_rgb(image_path), (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+    resized, _ = letterbox_image(imread_rgb(image_path), image_size)
     np.save(cache_path, np.ascontiguousarray(resized, dtype=np.uint8), allow_pickle=False)
     meta_path.write_text(json.dumps(_build_metadata(image_path, image_size), ensure_ascii=False, indent=2), encoding="utf-8")
     return "updated" if existed else "created"

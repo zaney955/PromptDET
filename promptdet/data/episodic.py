@@ -3,9 +3,8 @@ from __future__ import annotations
 from collections import OrderedDict, defaultdict
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -17,7 +16,8 @@ from promptdet.data.prompt_hints import (
     build_query_detection_targets,
     sample_slot_colors,
 )
-from promptdet.data.resize_cache import get_resize_cache_paths
+from promptdet.data.letterbox import compute_letterbox_params, letterbox_boxes, letterbox_image
+from promptdet.data.resize_cache import get_resize_cache_paths, is_resize_cache_stale
 from promptdet.data.yolo_io import imread_rgb, load_image_list, parse_yolo_label_file, probe_image_size
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 
@@ -31,16 +31,6 @@ def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
 
 def _numpy_to_uint8_chw_tensor(image: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).contiguous()
-
-
-def resize_image_and_boxes(image: np.ndarray, boxes: torch.Tensor, size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    orig_h, orig_w = image.shape[:2]
-    resized = cv2.resize(image, (size, size), interpolation=cv2.INTER_LINEAR)
-    boxes = boxes.clone().float()
-    if boxes.numel() > 0:
-        boxes[:, 0::2] *= size / orig_w
-        boxes[:, 1::2] *= size / orig_h
-    return _numpy_to_tensor(resized), boxes
 
 
 def _yolo_box_valid(box: list[float]) -> bool:
@@ -111,6 +101,7 @@ class PromptEpisodeDataset(Dataset):
                 "path": str(image_path),
                 "width": image_w,
                 "height": image_h,
+                "letterbox_params": compute_letterbox_params(image_w, image_h, self.image_size),
             }
             label_path = self.label_paths_by_stem.get(image_path.stem, self.labels_dir / f"{image_path.stem}.txt")
             for category_id, bbox in parse_yolo_label_file(label_path):
@@ -145,9 +136,7 @@ class PromptEpisodeDataset(Dataset):
         if boxes.numel() == 0:
             return boxes
         image_record = self.image_records[image_id]
-        boxes[:, 0::2] *= self.image_size / max(float(image_record["width"]), 1.0)
-        boxes[:, 1::2] *= self.image_size / max(float(image_record["height"]), 1.0)
-        return boxes
+        return letterbox_boxes(boxes, image_record["letterbox_params"])
 
     def _load_resized_image_tensor(self, image_id: int) -> torch.Tensor:
         cached = self.resized_tensor_cache.get(image_id)
@@ -157,14 +146,14 @@ class PromptEpisodeDataset(Dataset):
         path = Path(self.image_records[image_id]["path"]).resolve()
         if self.resize_cache_dir is not None:
             cache_path, _ = get_resize_cache_paths(self.resize_cache_dir, path, self.image_size)
-            if cache_path.exists():
+            if cache_path.exists() and not is_resize_cache_stale(self.resize_cache_dir, path, self.image_size):
                 resized = np.load(cache_path, allow_pickle=False)
             else:
                 image = imread_rgb(path)
-                resized = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+                resized, _ = letterbox_image(image, self.image_size)
         else:
             image = imread_rgb(path)
-            resized = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+            resized, _ = letterbox_image(image, self.image_size)
         image_tensor = _numpy_to_uint8_chw_tensor(resized)
         self.resized_tensor_cache[image_id] = image_tensor
         self.resized_tensor_cache.move_to_end(image_id)
