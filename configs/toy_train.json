@@ -7,7 +7,12 @@
     "prompt_dim": 256,
     "reg_max": 16,
     "num_attention_heads": 8,
-    "backbone_widths": [48, 96, 192, 384],
+    "backbone_widths": [
+      48,
+      96,
+      192,
+      384
+    ],
     "label_dropout": 0.4,
     "logit_scale_init": 1.5,
     "max_logit_scale": 2.5
@@ -16,6 +21,9 @@
     "train_list": "./toy_data/train.txt",
     "val_list": "./toy_data/val.txt",
     "labels_dir": "./toy_data/labels",
+    "resize_cache_enabled": true,
+    "resize_cache_dir": "./cache/RXZCCOMP_test",
+    "resize_cache_workers": 4,
     "class_names": {
       "0": "square",
       "1": "circle",
