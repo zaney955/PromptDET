@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image
 import torch
 
@@ -13,22 +15,37 @@ from promptdet.data.prompt_hints import (
     build_prompt_target_map,
     sample_slot_colors,
 )
+from promptdet.data.resize_cache import get_resize_cache_paths
+from promptdet.data.yolo_io import imread_rgb
 from promptdet.models.promptdet import PromptDET
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 from promptdet.utils.checkpoint import load_checkpoint
 from promptdet.utils.visualize import save_detection_visualization, save_grounding_visualizations
 
 
-def pil_to_tensor(image: Image.Image) -> torch.Tensor:
-    import numpy as np
-
-    arr = np.asarray(image, dtype=np.float32) / 255.0
+def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
+    arr = image.astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1)
 
 
-def resize_image(image: Image.Image, size: int) -> torch.Tensor:
-    image = image.resize((size, size), Image.Resampling.BILINEAR)
-    return pil_to_tensor(image)
+def _load_resized_rgb(path: Path, size: int, resize_cache_dir: Path | None) -> np.ndarray:
+    resolved_path = path.resolve()
+    if resize_cache_dir is not None:
+        cache_path, _ = get_resize_cache_paths(resize_cache_dir, resolved_path, size)
+        if cache_path.exists():
+            return np.load(cache_path, allow_pickle=False)
+    image = imread_rgb(resolved_path)
+    return cv2.resize(image, (size, size), interpolation=cv2.INTER_LINEAR)
+
+
+def _load_original_and_resized(path: Path, size: int, resize_cache_dir: Path | None) -> tuple[np.ndarray, torch.Tensor]:
+    original = imread_rgb(path.resolve())
+    resized = _load_resized_rgb(path, size, resize_cache_dir)
+    return original, _numpy_to_tensor(resized)
+
+
+def _resolve_cli_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
 
 
 def _valid_yolo_box(box: list[float] | tuple[float, ...]) -> bool:
@@ -46,7 +63,12 @@ def parse_args():
     parser.add_argument("--prompt-image", type=str, default=None)
     parser.add_argument("--prompt-box", type=float, nargs=4, default=None, help="normalized x_center y_center width height on the original prompt image")
     parser.add_argument("--prompt-label", type=int, default=None)
-    parser.add_argument("--query-image", type=str, required=True, help="Path to one query image or a directory of query images.")
+    parser.add_argument(
+        "--query-image",
+        type=str,
+        required=True,
+        help="Path to one query image, a directory of query images, or a txt file with one image path per line.",
+    )
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--score-threshold", type=float, default=None)
@@ -58,16 +80,62 @@ def parse_args():
     return parser.parse_args()
 
 
-def _iter_query_images(query_path: Path) -> list[Path]:
+def _is_image_path(path: Path) -> bool:
+    return path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _load_query_images_from_txt(query_path: Path) -> list[Path]:
+    image_paths: list[Path] = []
+    for line_no, raw_line in enumerate(query_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        image_path = Path(line)
+        if not image_path.is_absolute():
+            image_path = (query_path.parent / image_path).resolve()
+        else:
+            image_path = image_path.resolve()
+        if not image_path.is_file():
+            raise ValueError(f"Query image list entry does not exist at line {line_no}: {line}")
+        if not _is_image_path(image_path):
+            raise ValueError(f"Query image list entry is not a supported image at line {line_no}: {line}")
+        image_paths.append(image_path)
+    if not image_paths:
+        raise ValueError(f"No query images found in txt file: {query_path}")
+    return image_paths
+
+
+def _iter_query_images(query_path: Path) -> tuple[list[Path], bool]:
     if query_path.is_file():
-        return [query_path]
+        if query_path.suffix.lower() == ".txt":
+            return _load_query_images_from_txt(query_path), True
+        if not _is_image_path(query_path):
+            raise ValueError(f"--query-image file must be an image or txt list, got: {query_path}")
+        return [query_path], False
     if not query_path.is_dir():
-        raise ValueError(f"--query-image must be an image file or directory, got: {query_path}")
-    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    image_paths = sorted(path for path in query_path.iterdir() if path.is_file() and path.suffix.lower() in image_suffixes)
+        hint = ""
+        query_text = str(query_path)
+        if query_text.startswith("/media/") and not query_path.exists():
+            hint = ""
+        elif query_text.startswith(str(Path.cwd() / "media")):
+            hint = " If you meant an absolute Linux path, check whether the input is missing the leading '/'."
+        raise ValueError(f"--query-image must be an image file, directory, or txt list, got: {query_path}.{hint}")
+    image_paths = sorted(path for path in query_path.iterdir() if path.is_file() and _is_image_path(path))
     if not image_paths:
         raise ValueError(f"No query images found in directory: {query_path}")
-    return image_paths
+    return image_paths, True
+
+
+def _build_batch_output_names(query_images: list[Path]) -> dict[Path, str]:
+    used_names: dict[str, int] = {}
+    output_names: dict[Path, str] = {}
+    for image_path in query_images:
+        base_name = image_path.stem
+        suffix_index = used_names.get(base_name, 0)
+        output_name = base_name if suffix_index == 0 else f"{base_name}_{suffix_index}"
+        used_names[base_name] = suffix_index + 1
+        output_names[image_path] = output_name
+    return output_names
 
 
 def _load_prompt_set(
@@ -78,6 +146,7 @@ def _load_prompt_set(
     hint_bg_expand: float,
     random_color_min_distance: float,
     center_target_sigma: float,
+    resize_cache_dir: Path | None,
 ):
     if args.prompt_spec:
         prompt_spec_path = Path(args.prompt_spec).resolve()
@@ -105,12 +174,12 @@ def _load_prompt_set(
         prompt_image_path = Path(prompt["image"])
         if not prompt_image_path.is_absolute() and prompt_spec_path is not None:
             prompt_image_path = (prompt_spec_path.parent / prompt_image_path).resolve()
-        prompt_image = Image.open(prompt_image_path).convert("RGB")
+        prompt_image = imread_rgb(prompt_image_path.resolve())
         prompt_source_index = image_path_to_source_index.get(str(prompt_image_path))
         if prompt_source_index is None:
             prompt_source_index = len(prompt_images)
             image_path_to_source_index[str(prompt_image_path)] = prompt_source_index
-            prompt_images.append(resize_image(prompt_image, image_size))
+            prompt_images.append(_numpy_to_tensor(_load_resized_rgb(prompt_image_path, image_size, resize_cache_dir)))
         for ann in prompt["annotations"]:
             label = int(ann["label"])
             bbox_raw = ann["bbox"]
@@ -122,11 +191,11 @@ def _load_prompt_set(
             slot = label_to_slot.setdefault(label, len(label_to_slot))
             bbox = yolo_xywh_to_xyxy_tensor(
                 torch.tensor([bbox_raw], dtype=torch.float32),
-                prompt_image.size[0],
-                prompt_image.size[1],
+                int(prompt_image.shape[1]),
+                int(prompt_image.shape[0]),
             )[0]
-            bbox[0::2] *= image_size / prompt_image.size[0]
-            bbox[1::2] *= image_size / prompt_image.size[1]
+            bbox[0::2] *= image_size / max(int(prompt_image.shape[1]), 1)
+            bbox[1::2] *= image_size / max(int(prompt_image.shape[0]), 1)
             prompt_boxes.append(bbox)
             hint = build_prompt_hint_map(
                 image_size,
@@ -179,6 +248,7 @@ def _run_single_query(
     query_path: Path,
     device: torch.device,
     image_size: int,
+    resize_cache_dir: Path | None,
     score_threshold: float,
     pre_score_topk: int,
     local_peak_kernel: int,
@@ -186,8 +256,9 @@ def _run_single_query(
     oversize_box_gamma: float,
     max_detections: int,
 ) -> tuple[Image.Image, dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
-    query_pil = Image.open(query_path).convert("RGB")
-    query_tensor = resize_image(query_pil, image_size).unsqueeze(0).to(device)
+    query_rgb, query_tensor = _load_original_and_resized(query_path, image_size, resize_cache_dir)
+    query_pil = Image.fromarray(query_rgb, mode="RGB")
+    query_tensor = query_tensor.unsqueeze(0).to(device)
     with torch.no_grad():
         raw = model(
             prompt_batch["prompt_images"].to(device),
@@ -239,6 +310,9 @@ def main():
     if args.max_detections is not None:
         config.train.max_detections = args.max_detections
     device = torch.device(config.train.device if torch.cuda.is_available() or config.train.device == "cpu" else "cpu")
+    resize_cache_dir = None
+    if config.data.resize_cache_enabled and config.data.resize_cache_dir:
+        resize_cache_dir = Path(config.data.resize_cache_dir).expanduser().resolve()
 
     model = PromptDET(config.model, config.dense_grounding).to(device)
     load_checkpoint(args.checkpoint, model, map_location=device.type)
@@ -253,13 +327,14 @@ def main():
         config.dense_grounding.hint_bg_expand,
         config.dense_grounding.random_color_min_distance,
         config.loss.center_target_sigma,
+        resize_cache_dir,
     )
-    query_path = Path(args.query_image).resolve()
-    query_images = _iter_query_images(query_path)
+    query_path = _resolve_cli_path(args.query_image)
+    query_images, batch_mode = _iter_query_images(query_path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    batch_mode = query_path.is_dir()
     batch_summary = []
+    batch_output_names = _build_batch_output_names(query_images) if batch_mode else {}
 
     for current_query_path in query_images:
         query_pil, preds, grounding_aux = _run_single_query(
@@ -268,6 +343,7 @@ def main():
             current_query_path,
             device=device,
             image_size=config.model.image_size,
+            resize_cache_dir=resize_cache_dir,
             score_threshold=config.train.score_threshold,
             pre_score_topk=config.train.pre_score_topk,
             local_peak_kernel=config.train.local_peak_kernel,
@@ -280,7 +356,7 @@ def main():
             "scores": preds["scores"].cpu().tolist(),
             "labels": preds["labels"].cpu().tolist(),
         }
-        current_output_dir = output_dir / current_query_path.stem if batch_mode else output_dir
+        current_output_dir = output_dir / batch_output_names[current_query_path] if batch_mode else output_dir
         current_output_dir.mkdir(parents=True, exist_ok=True)
         save_detection_visualization(query_pil, preds, current_output_dir / "prediction.png")
         (current_output_dir / "prediction.json").write_text(

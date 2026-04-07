@@ -159,6 +159,20 @@ python detect.py \
 
 When `--query-image` points to a directory, each image is written to its own subdirectory under `--output-dir`, and a `batch_summary.json` file is also produced.
 
+Batch txt-list mode:
+
+```bash
+python detect.py \
+  --config ./outputs/exp1/config.json \
+  --checkpoint ./outputs/exp1/best.pt \
+  --prompt-spec ./toy_data/prompt_set.json \
+  --query-image ./toy_data/query_images.txt \
+  --output-dir ./outputs/infer_list \
+  --conf-threshold 0.15
+```
+
+When `--query-image` points to a `txt` file, each non-empty line is treated as one image path. Relative paths are resolved against the `txt` file location. Lines starting with `#` are ignored. Results are written in batch mode and a `batch_summary.json` file is also produced.
+
 `prompt_spec` format:
 
 ```json
