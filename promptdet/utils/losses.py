@@ -425,6 +425,13 @@ class PromptDetectionLoss(torch.nn.Module):
         )
         self.dfl = DFLoss(reg_max)
 
+    @staticmethod
+    def _scale_sort_key(name: str) -> int:
+        try:
+            return int(name[1:])
+        except (IndexError, ValueError):
+            return 999
+
     def _roi_contrast_loss(
         self,
         class_maps: torch.Tensor,
@@ -498,7 +505,8 @@ class PromptDetectionLoss(torch.nn.Module):
         stride_tensor = outputs["stride_tensor"]
         box_logits = outputs["box_distribution"]
         class_mask = outputs["class_mask"]
-        roi_feature_maps = outputs["roi_feature_maps"]["p3"]
+        roi_feature_scale = min(outputs["roi_feature_maps"].keys(), key=self._scale_sort_key)
+        roi_feature_maps = outputs["roi_feature_maps"][roi_feature_scale]
         roi_scale_tokens = outputs["roi_scale_tokens"]
 
         total_objectness = pred_scores.new_tensor(0.0)

@@ -2,6 +2,11 @@
   "model": {
     "image_size": 640,
     "max_prompt_classes": 20,
+    "feature_scales": [
+      "p3",
+      "p4",
+      "p5"
+    ],
     "prompt_crop_size": 256,
     "neck_channels": 192,
     "prompt_dim": 256,
@@ -56,10 +61,10 @@
     "positive_query_shortlist": 6,
     "episodes_per_epoch": 1000,
     "val_episodes": 200,
-    "num_workers": 1
+    "num_workers": 4
   },
   "train": {
-    "output_dir": "./outputs/RXZCCOMP_test/exp2",
+    "output_dir": "./outputs/RXZCCOMP_test/exp3",
     "device": "cuda",
     "batch_size": 1,
     "epochs": 200,

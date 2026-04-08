@@ -9,21 +9,6 @@ from torch import nn
 from .common import ConvBNAct, MLP
 
 
-def crop_and_resize(images: torch.Tensor, boxes: torch.Tensor, size: int) -> torch.Tensor:
-    crops = []
-    _, _, height, width = images.shape
-    for image, box in zip(images, boxes):
-        x1, y1, x2, y2 = box.round().long().tolist()
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(x1 + 1, min(x2, width))
-        y2 = max(y1 + 1, min(y2, height))
-        crop = image[:, y1:y2, x1:x2].unsqueeze(0)
-        crop = F.interpolate(crop, size=(size, size), mode="bilinear", align_corners=False)
-        crops.append(crop.squeeze(0))
-    return torch.stack(crops, dim=0)
-
-
 def roi_pool_feature_mean(feats: torch.Tensor, boxes: torch.Tensor, image_h: int, image_w: int) -> torch.Tensor:
     pooled = []
     _, _, feat_h, feat_w = feats.shape
@@ -57,12 +42,14 @@ class PromptEncoder(nn.Module):
         crop_size: int,
         label_dropout: float,
         max_prompt_classes: int,
+        scales: list[str] | tuple[str, ...] | None = None,
     ):
         super().__init__()
         self.prompt_dim = prompt_dim
         self.crop_size = crop_size
         self.label_dropout = label_dropout
         self.max_prompt_classes = max_prompt_classes
+        self.scales = tuple(scales or ("p2", "p3", "p4", "p5"))
 
         self.crop_encoder = nn.Sequential(
             ConvBNAct(3, 48, 3, stride=2),
@@ -75,43 +62,32 @@ class PromptEncoder(nn.Module):
         self.class_slot_embed = nn.Embedding(max_prompt_classes, prompt_dim)
         self.local_slot_proj = nn.Linear(prompt_dim, out_channels)
         self.scale_proj = nn.ModuleDict({
-            "p3": nn.Linear(prompt_dim, out_channels),
-            "p4": nn.Linear(prompt_dim, out_channels),
-            "p5": nn.Linear(prompt_dim, out_channels),
+            name: nn.Linear(prompt_dim, out_channels)
+            for name in self.scales
         })
         self.refine = MLP(prompt_dim, hidden_dim=prompt_dim * 2, out_dim=prompt_dim)
 
     def forward(
         self,
-        prompt_images: torch.Tensor,
-        prompt_source_indices: torch.Tensor,
+        prompt_crops: torch.Tensor,
         prompt_boxes: torch.Tensor,
         prompt_feats: Dict[str, torch.Tensor],
         prompt_class_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
         prompt_class_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        batch_size, _, _, image_h, image_w = prompt_images.shape
+        batch_size = prompt_boxes.shape[0]
         num_instances = prompt_boxes.shape[1]
+        feat_h, feat_w = next(iter(prompt_feats.values())).shape[-2:]
+        image_h = feat_h * 4
+        image_w = feat_w * 4
         if prompt_class_mask.shape[1] > self.max_prompt_classes:
             raise ValueError(
                 f"Batch contains {prompt_class_mask.shape[1]} prompt classes, "
                 f"but model.max_prompt_classes={self.max_prompt_classes}."
             )
 
-        flat_indices = prompt_source_indices.clamp(min=0)
-        gather_index = flat_indices.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(
-            batch_size,
-            num_instances,
-            prompt_images.shape[2],
-            image_h,
-            image_w,
-        )
-        instance_images = torch.gather(prompt_images, dim=1, index=gather_index)
-        flat_images = instance_images.reshape(batch_size * num_instances, *instance_images.shape[2:])
-        flat_boxes = prompt_boxes.reshape(batch_size * num_instances, 4)
-        crop = crop_and_resize(flat_images, flat_boxes, self.crop_size)
-        crop_feat = self.crop_encoder(crop)
+        crop_feat = self.crop_encoder(prompt_crops.reshape(batch_size * num_instances, *prompt_crops.shape[2:]))
         local_tokens = self.local_proj(crop_feat).flatten(2).transpose(1, 2)
         token_count = local_tokens.shape[1]
         local_tokens = local_tokens.view(batch_size, num_instances, token_count, -1)
@@ -119,7 +95,7 @@ class PromptEncoder(nn.Module):
         crop_global = crop_feat.mean(dim=(2, 3)).view(batch_size, num_instances, -1)
         roi_globals = []
         flat_prompt_boxes = prompt_boxes.reshape(batch_size * num_instances, 4)
-        for name in ("p3", "p4", "p5"):
+        for name in prompt_feats.keys():
             flat_feat = prompt_feats[name].reshape(batch_size * num_instances, *prompt_feats[name].shape[2:])
             roi_globals.append(roi_pool_feature_mean(flat_feat, flat_prompt_boxes, image_h, image_w))
         support_global = torch.stack(roi_globals, dim=0).mean(dim=0).view(batch_size, num_instances, -1)

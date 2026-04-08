@@ -20,12 +20,12 @@ class PromptDetBackbone(nn.Module):
         self.stage2 = CSPStage(c2, c3, depth=2)
         self.stage3 = CSPStage(c3, c4, depth=2)
         self.stage4 = CSPStage(c4, c4, depth=2)
-        self.out_channels = [c3, c4, c4]
+        self.out_channels = [c2, c3, c4, c4]
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         x = self.stem(x)
-        x = self.stage1(x)
-        p3 = self.stage2(x)
+        p2 = self.stage1(x)
+        p3 = self.stage2(p2)
         p4 = self.stage3(p3)
         p5 = self.stage4(p4)
-        return {"p3": p3, "p4": p4, "p5": p5}
+        return {"p2": p2, "p3": p3, "p4": p4, "p5": p5}

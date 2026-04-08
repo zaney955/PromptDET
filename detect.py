@@ -28,6 +28,18 @@ def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1)
 
 
+def _crop_prompt_region(image: np.ndarray, box: torch.Tensor, crop_size: int) -> torch.Tensor:
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = box.tolist()
+    x1 = int(max(0, min(round(x1), width - 1)))
+    y1 = int(max(0, min(round(y1), height - 1)))
+    x2 = int(max(x1 + 1, min(round(x2), width)))
+    y2 = int(max(y1 + 1, min(round(y2), height)))
+    crop = np.ascontiguousarray(image[y1:y2, x1:x2], dtype=np.uint8)
+    crop, _ = letterbox_image(crop, crop_size)
+    return _numpy_to_tensor(crop)
+
+
 def _load_resized_rgb(path: Path, size: int, resize_cache_dir: Path | None) -> np.ndarray:
     resolved_path = path.resolve()
     if resize_cache_dir is not None:
@@ -147,6 +159,7 @@ def _load_prompt_set(
     hint_bg_expand: float,
     random_color_min_distance: float,
     center_target_sigma: float,
+    prompt_crop_size: int,
     resize_cache_dir: Path | None,
 ):
     if args.prompt_spec:
@@ -166,6 +179,7 @@ def _load_prompt_set(
     prompt_boxes = []
     prompt_hint_maps = []
     prompt_target_maps = []
+    prompt_crops = []
     prompt_class_indices = []
     prompt_source_indices = []
     label_to_slot = {}
@@ -195,6 +209,7 @@ def _load_prompt_set(
                 int(prompt_image.shape[1]),
                 int(prompt_image.shape[0]),
             )[0]
+            prompt_crops.append(_crop_prompt_region(prompt_image, bbox, prompt_crop_size))
             bbox = letterbox_boxes(
                 bbox.unsqueeze(0),
                 compute_letterbox_params(int(prompt_image.shape[1]), int(prompt_image.shape[0]), image_size),
@@ -236,6 +251,7 @@ def _load_prompt_set(
         "prompt_boxes": torch.stack(prompt_boxes, dim=0).unsqueeze(0),
         "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0).unsqueeze(0),
         "prompt_target_maps": torch.stack(prompt_target_maps, dim=0).unsqueeze(0),
+        "prompt_crops": torch.stack(prompt_crops, dim=0).unsqueeze(0),
         "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long).unsqueeze(0),
         "prompt_source_indices": torch.tensor(prompt_source_indices, dtype=torch.long).unsqueeze(0),
         "prompt_instance_mask": torch.ones((1, len(prompt_boxes)), dtype=torch.bool),
@@ -269,6 +285,7 @@ def _run_single_query(
             prompt_batch["prompt_boxes"].to(device),
             prompt_batch["prompt_hint_maps"].to(device),
             prompt_batch["prompt_target_maps"].to(device),
+            prompt_batch["prompt_crops"].to(device),
             prompt_batch["prompt_class_indices"].to(device),
             prompt_batch["prompt_source_indices"].to(device),
             prompt_batch["prompt_instance_mask"].to(device),
@@ -330,6 +347,7 @@ def main():
         config.dense_grounding.hint_bg_expand,
         config.dense_grounding.random_color_min_distance,
         config.loss.center_target_sigma,
+        config.model.prompt_crop_size,
         resize_cache_dir,
     )
     query_path = _resolve_cli_path(args.query_image)

@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 class ModelConfig:
     image_size: int = 256
     max_prompt_classes: int = 4
+    feature_scales: List[str] = field(default_factory=lambda: ["p2", "p3", "p4", "p5"])
     backbone_widths: List[int] = field(default_factory=lambda: [48, 96, 192, 384])
     neck_channels: int = 192
     prompt_dim: int = 256
@@ -55,6 +56,8 @@ class DataConfig:
     resize_cache_enabled: bool = False
     resize_cache_dir: str = ""
     resize_cache_workers: int = 4
+    prompt_crop_cache_enabled: bool = True
+    prompt_crop_cache_dir: str = ""
     min_prompt_classes: int = 1
     max_prompt_classes: int = 3
     max_prompt_instances_per_class: int = 2

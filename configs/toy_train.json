@@ -2,6 +2,11 @@
   "model": {
     "image_size": 256,
     "max_prompt_classes": 8,
+    "feature_scales": [
+      "p3",
+      "p4",
+      "p5"
+    ],
     "prompt_crop_size": 128,
     "neck_channels": 192,
     "prompt_dim": 256,
@@ -46,7 +51,7 @@
     "num_workers": 2
   },
   "train": {
-    "output_dir": "./outputs/toy_data/exp18",
+    "output_dir": "./outputs/toy_data/exp19",
     "device": "cuda",
     "batch_size": 8,
     "epochs": 100,

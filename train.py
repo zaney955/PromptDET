@@ -109,6 +109,11 @@ def main():
                 dist.barrier(device_ids=[dist_info["local_rank"]])
             else:
                 dist.barrier()
+    prompt_crop_cache_dir = None
+    if config.data.prompt_crop_cache_enabled:
+        prompt_crop_cache_dir = config.data.prompt_crop_cache_dir or resize_cache_dir
+        if prompt_crop_cache_dir is None:
+            prompt_crop_cache_dir = str((output_dir / "prompt_crop_cache").resolve())
 
     train_dataset = PromptEpisodeDataset(
         image_list_path=config.data.train_list,
@@ -121,6 +126,7 @@ def main():
         max_prompt_classes=config.data.max_prompt_classes,
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
+        prompt_crop_size=config.model.prompt_crop_size,
         color_min_distance=config.dense_grounding.random_color_min_distance,
         center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
@@ -128,6 +134,7 @@ def main():
         hard_positive_ratio=config.data.hard_positive_ratio,
         positive_query_shortlist=config.data.positive_query_shortlist,
         resize_cache_dir=resize_cache_dir,
+        prompt_crop_cache_dir=prompt_crop_cache_dir,
         seed=None,
     )
     val_dataset = PromptEpisodeDataset(
@@ -141,6 +148,7 @@ def main():
         max_prompt_classes=config.data.max_prompt_classes,
         max_prompt_instances_per_class=config.data.max_prompt_instances_per_class,
         max_prompt_images=config.data.max_prompt_images,
+        prompt_crop_size=config.model.prompt_crop_size,
         color_min_distance=config.dense_grounding.random_color_min_distance,
         center_target_sigma=config.loss.center_target_sigma,
         hint_inner_shrink=config.dense_grounding.hint_inner_shrink,
@@ -148,6 +156,7 @@ def main():
         hard_positive_ratio=config.data.hard_positive_ratio,
         positive_query_shortlist=config.data.positive_query_shortlist,
         resize_cache_dir=resize_cache_dir,
+        prompt_crop_cache_dir=prompt_crop_cache_dir,
         seed=config.train.seed + 100_000,
     )
 

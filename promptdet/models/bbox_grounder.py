@@ -19,6 +19,7 @@ class BBoxPromptGrounder(nn.Module):
         max_prompt_classes: int,
         image_size: int,
         cfg: DenseGroundingConfig,
+        scales: list[str] | tuple[str, ...] | None = None,
     ):
         super().__init__()
         self.channels = channels
@@ -33,9 +34,10 @@ class BBoxPromptGrounder(nn.Module):
             max_prompt_classes=max_prompt_classes,
             cfg=cfg,
         )
+        self.scales = tuple(scales or ("p2", "p3", "p4", "p5"))
         self.context_fuse = nn.ModuleDict({
             name: ConvBNAct(channels * 2, channels, 3)
-            for name in ("p3", "p4", "p5")
+            for name in self.scales
         })
         self.hint_proj = nn.Conv2d(3, channels, 1)
         self.box_embed = nn.Linear(4, channels)
@@ -120,7 +122,7 @@ class BBoxPromptGrounder(nn.Module):
         )
         query_context_feat = painter_outputs["query_context_feat"]
         fused_feats = {}
-        for name in ("p3", "p4", "p5"):
+        for name in self.scales:
             resized_context = F.interpolate(
                 query_context_feat,
                 size=query_feats[name].shape[-2:],

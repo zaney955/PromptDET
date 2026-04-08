@@ -147,6 +147,7 @@ def train(
             prompt_boxes = batch["prompt_boxes"].to(device, non_blocking=True)
             prompt_hint_maps = batch["prompt_hint_maps"].to(device, non_blocking=True)
             prompt_target_maps = batch["prompt_target_maps"].to(device, non_blocking=True)
+            prompt_crops = batch["prompt_crops"].to(device, non_blocking=True)
             prompt_class_indices = batch["prompt_class_indices"].to(device, non_blocking=True)
             prompt_source_indices = batch["prompt_source_indices"].to(device, non_blocking=True)
             prompt_instance_mask = batch["prompt_instance_mask"].to(device, non_blocking=True)
@@ -172,6 +173,7 @@ def train(
                     prompt_boxes,
                     prompt_hint_maps,
                     prompt_target_maps,
+                    prompt_crops,
                     prompt_class_indices,
                     prompt_source_indices,
                     prompt_instance_mask,

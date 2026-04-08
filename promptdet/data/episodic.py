@@ -17,11 +17,13 @@ from promptdet.data.prompt_hints import (
     sample_slot_colors,
 )
 from promptdet.data.letterbox import compute_letterbox_params, letterbox_boxes, letterbox_image
+from promptdet.data.prompt_crop_cache import load_or_create_prompt_crop
 from promptdet.data.resize_cache import get_resize_cache_paths, is_resize_cache_stale
 from promptdet.data.yolo_io import imread_rgb, load_image_list, parse_yolo_label_file, probe_image_size
 from promptdet.utils.box_formats import yolo_xywh_to_xyxy_tensor
 
 DEFAULT_RESIZED_IMAGE_CACHE_SIZE = 32
+DEFAULT_ORIGINAL_IMAGE_CACHE_SIZE = 8
 
 
 def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
@@ -31,6 +33,18 @@ def _numpy_to_tensor(image: np.ndarray) -> torch.Tensor:
 
 def _numpy_to_uint8_chw_tensor(image: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).contiguous()
+
+
+def crop_box_region(image: np.ndarray, box: torch.Tensor, output_size: int) -> torch.Tensor:
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = box.tolist()
+    x1 = int(max(0, min(round(x1), width - 1)))
+    y1 = int(max(0, min(round(y1), height - 1)))
+    x2 = int(max(x1 + 1, min(round(x2), width)))
+    y2 = int(max(y1 + 1, min(round(y2), height)))
+    crop = np.ascontiguousarray(image[y1:y2, x1:x2], dtype=np.uint8)
+    crop, _ = letterbox_image(crop, output_size)
+    return _numpy_to_tensor(crop)
 
 
 def _yolo_box_valid(box: list[float]) -> bool:
@@ -53,6 +67,7 @@ class PromptEpisodeDataset(Dataset):
         max_prompt_classes: int = 3,
         max_prompt_instances_per_class: int = 2,
         max_prompt_images: int = 4,
+        prompt_crop_size: int = 128,
         color_min_distance: float = 0.45,
         center_target_sigma: float = 0.35,
         hint_inner_shrink: float = 0.6,
@@ -60,6 +75,7 @@ class PromptEpisodeDataset(Dataset):
         hard_positive_ratio: float = 0.5,
         positive_query_shortlist: int = 6,
         resize_cache_dir: str | None = None,
+        prompt_crop_cache_dir: str | None = None,
         seed: int | None = None,
     ):
         super().__init__()
@@ -71,6 +87,7 @@ class PromptEpisodeDataset(Dataset):
         self.max_prompt_classes = max_prompt_classes
         self.max_prompt_instances_per_class = max_prompt_instances_per_class
         self.max_prompt_images = max_prompt_images
+        self.prompt_crop_size = prompt_crop_size
         self.color_min_distance = color_min_distance
         self.center_target_sigma = center_target_sigma
         self.hint_inner_shrink = hint_inner_shrink
@@ -78,10 +95,15 @@ class PromptEpisodeDataset(Dataset):
         self.hard_positive_ratio = hard_positive_ratio
         self.positive_query_shortlist = positive_query_shortlist
         self.resize_cache_dir = Path(resize_cache_dir).expanduser().resolve() if resize_cache_dir else None
+        self.prompt_crop_cache_dir = (
+            Path(prompt_crop_cache_dir).expanduser().resolve() if prompt_crop_cache_dir else None
+        )
         self.seed = seed
         self.label_paths_by_stem = {}
         self.resized_tensor_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self.resized_tensor_cache_size = DEFAULT_RESIZED_IMAGE_CACHE_SIZE
+        self.original_image_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self.original_image_cache_size = DEFAULT_ORIGINAL_IMAGE_CACHE_SIZE
 
         self.image_records: Dict[int, dict] = {}
         self.image_to_anns: Dict[int, List[dict]] = defaultdict(list)
@@ -160,6 +182,31 @@ class PromptEpisodeDataset(Dataset):
         if len(self.resized_tensor_cache) > self.resized_tensor_cache_size:
             self.resized_tensor_cache.popitem(last=False)
         return image_tensor.float().div(255.0)
+
+    def _load_original_image(self, image_id: int) -> np.ndarray:
+        cached = self.original_image_cache.get(image_id)
+        if cached is not None:
+            self.original_image_cache.move_to_end(image_id)
+            return cached
+        path = Path(self.image_records[image_id]["path"]).resolve()
+        image = imread_rgb(path)
+        self.original_image_cache[image_id] = image
+        self.original_image_cache.move_to_end(image_id)
+        if len(self.original_image_cache) > self.original_image_cache_size:
+            self.original_image_cache.popitem(last=False)
+        return image
+
+    def _load_prompt_crop(self, image_id: int, box: torch.Tensor) -> torch.Tensor:
+        image_path = Path(self.image_records[image_id]["path"]).resolve()
+        if self.prompt_crop_cache_dir is not None:
+            crop = load_or_create_prompt_crop(
+                self.prompt_crop_cache_dir,
+                image_path,
+                box,
+                self.prompt_crop_size,
+            )
+            return _numpy_to_tensor(crop)
+        return crop_box_region(self._load_original_image(image_id), box, self.prompt_crop_size)
 
     def _sample_prompt_classes(self, rng: random.Random) -> List[int]:
         max_classes = min(self.max_prompt_classes, len(self.classes))
@@ -349,6 +396,7 @@ class PromptEpisodeDataset(Dataset):
         prompt_boxes = []
         prompt_hint_maps = []
         prompt_target_maps = []
+        prompt_crops = []
         prompt_class_indices = []
         prompt_source_indices = []
         for instance in prompt_instances:
@@ -374,6 +422,12 @@ class PromptEpisodeDataset(Dataset):
                     int(instance["class_slot"]),
                     slot_colors,
                     center_sigma=self.center_target_sigma,
+                )
+            )
+            prompt_crops.append(
+                self._load_prompt_crop(
+                    instance["image_id"],
+                    torch.tensor(instance["bbox"], dtype=torch.float32),
                 )
             )
             prompt_class_indices.append(instance["class_slot"])
@@ -427,6 +481,7 @@ class PromptEpisodeDataset(Dataset):
             "prompt_boxes": torch.stack(prompt_boxes, dim=0),
             "prompt_hint_maps": torch.stack(prompt_hint_maps, dim=0),
             "prompt_target_maps": torch.stack(prompt_target_maps, dim=0),
+            "prompt_crops": torch.stack(prompt_crops, dim=0),
             "prompt_class_indices": torch.tensor(prompt_class_indices, dtype=torch.long),
             "prompt_source_indices": torch.tensor(prompt_source_indices, dtype=torch.long),
             "prompt_class_ids": torch.tensor(prompt_class_ids, dtype=torch.long),
@@ -461,6 +516,11 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         (batch_size, max_prompt_instances, PROMPT_TARGET_CHANNELS, height, width),
         dtype=torch.float32,
     )
+    crop_channels, crop_height, crop_width = batch[0]["prompt_crops"].shape[1:]
+    prompt_crops = torch.zeros(
+        (batch_size, max_prompt_instances, crop_channels, crop_height, crop_width),
+        dtype=torch.float32,
+    )
     prompt_class_indices = torch.zeros((batch_size, max_prompt_instances), dtype=torch.long)
     prompt_source_indices = torch.full((batch_size, max_prompt_instances), -1, dtype=torch.long)
     prompt_instance_mask = torch.zeros((batch_size, max_prompt_instances), dtype=torch.bool)
@@ -477,6 +537,7 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         prompt_boxes[batch_idx, :num_instances] = item["prompt_boxes"]
         prompt_hint_maps[batch_idx, :num_instances] = item["prompt_hint_maps"]
         prompt_target_maps[batch_idx, :num_instances] = item["prompt_target_maps"]
+        prompt_crops[batch_idx, :num_instances] = item["prompt_crops"]
         prompt_class_indices[batch_idx, :num_instances] = item["prompt_class_indices"]
         prompt_source_indices[batch_idx, :num_instances] = item["prompt_source_indices"]
         prompt_instance_mask[batch_idx, :num_instances] = True
@@ -490,6 +551,7 @@ def collate_episodes(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Te
         "prompt_boxes": prompt_boxes,
         "prompt_hint_maps": prompt_hint_maps,
         "prompt_target_maps": prompt_target_maps,
+        "prompt_crops": prompt_crops,
         "prompt_class_indices": prompt_class_indices,
         "prompt_source_indices": prompt_source_indices,
         "prompt_instance_mask": prompt_instance_mask,

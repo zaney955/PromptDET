@@ -204,12 +204,12 @@ class PromptQueryFusionBlock(nn.Module):
 
 
 class PromptFusionNeck(nn.Module):
-    def __init__(self, channels: int, prompt_dim: int, num_heads: int):
+    def __init__(self, channels: int, prompt_dim: int, num_heads: int, scales: list[str] | tuple[str, ...] | None = None):
         super().__init__()
+        scales = tuple(scales or ("p2", "p3", "p4", "p5"))
         self.blocks = nn.ModuleDict({
-            "p3": PromptQueryFusionBlock(channels, prompt_dim, num_heads),
-            "p4": PromptQueryFusionBlock(channels, prompt_dim, num_heads),
-            "p5": PromptQueryFusionBlock(channels, prompt_dim, num_heads),
+            name: PromptQueryFusionBlock(channels, prompt_dim, num_heads)
+            for name in scales
         })
 
     def set_activation_checkpointing(self, enabled: bool) -> None:
@@ -219,8 +219,9 @@ class PromptFusionNeck(nn.Module):
     def forward(self, feats: Dict[str, torch.Tensor], prompt: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
         shared_outputs = {}
         class_outputs = {}
-        for name, feat in feats.items():
-            shared_feat, class_feat = self.blocks[name](
+        for name, block in self.blocks.items():
+            feat = feats[name]
+            shared_feat, class_feat = block(
                 feat,
                 prompt["memory_tokens"],
                 prompt["memory_mask"],

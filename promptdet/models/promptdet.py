@@ -37,6 +37,7 @@ class PromptDET(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.context_cfg = context_cfg or DenseGroundingConfig()
+        self.feature_scales = tuple(cfg.feature_scales)
         self.backbone = PromptDetBackbone(cfg.backbone_widths)
         self.neck = PromptDetNeck(self.backbone.out_channels, cfg.neck_channels)
         self.prompt_encoder = PromptEncoder(
@@ -45,16 +46,28 @@ class PromptDET(nn.Module):
             crop_size=cfg.prompt_crop_size,
             label_dropout=cfg.label_dropout,
             max_prompt_classes=cfg.max_prompt_classes,
+            scales=self.feature_scales,
         )
-        self.prompt_fusion = PromptFusionNeck(cfg.neck_channels, cfg.prompt_dim, cfg.num_attention_heads)
+        self.prompt_fusion = PromptFusionNeck(
+            cfg.neck_channels,
+            cfg.prompt_dim,
+            cfg.num_attention_heads,
+            scales=self.feature_scales,
+        )
         self.grounder = BBoxPromptGrounder(
             channels=cfg.neck_channels,
             prompt_dim=cfg.prompt_dim,
             max_prompt_classes=cfg.max_prompt_classes,
             image_size=cfg.image_size,
             cfg=self.context_cfg,
+            scales=self.feature_scales,
         )
-        self.head = PromptDetectHead(cfg.neck_channels, cfg.reg_max, cfg.prompt_dim)
+        self.head = PromptDetectHead(
+            cfg.neck_channels,
+            cfg.reg_max,
+            cfg.prompt_dim,
+            scales=list(self.feature_scales),
+        )
         self.register_buffer("proj_bins", torch.arange(cfg.reg_max, dtype=torch.float32), persistent=False)
         self.logit_scale = nn.Parameter(torch.tensor(cfg.logit_scale_init))
         self.context_prior_strength = 1.0
@@ -90,6 +103,13 @@ class PromptDET(nn.Module):
         self.grounder.set_activation_checkpointing(enabled)
 
     @staticmethod
+    def _scale_sort_key(name: str) -> int:
+        try:
+            return int(name[1:])
+        except (IndexError, ValueError):
+            return 999
+
+    @staticmethod
     def _build_local_peak_mask(
         flat_scores: torch.Tensor,
         feature_shapes: list[tuple[int, int]],
@@ -120,6 +140,7 @@ class PromptDET(nn.Module):
         prompt_boxes: torch.Tensor,
         prompt_hint_maps: torch.Tensor,
         prompt_target_maps: torch.Tensor,
+        prompt_crops: torch.Tensor,
         prompt_class_indices: torch.Tensor,
         prompt_source_indices: torch.Tensor,
         prompt_instance_mask: torch.Tensor,
@@ -137,8 +158,7 @@ class PromptDET(nn.Module):
         )
         query_feats = self.neck(self.backbone(query_image))
         prompt_encoding = self.prompt_encoder(
-            prompt_images,
-            prompt_source_indices,
+            prompt_crops,
             prompt_boxes,
             prompt_feats,
             prompt_class_indices,
@@ -241,7 +261,8 @@ class PromptDET(nn.Module):
         flat_box_logits = []
         class_prototypes = F.normalize(class_prototypes, dim=-1, eps=1e-6)
         roi_feature_maps = outputs["roi_feature_maps"]
-        roi_scale_tokens = outputs["class_scale_tokens"]["p3"]
+        roi_scale_name = min(roi_feature_maps.keys(), key=self._scale_sort_key)
+        roi_scale_tokens = outputs["class_scale_tokens"][roi_scale_name]
         for level_idx, (box_logit, objectness_logit, targetness_logit, class_embedding, stride) in enumerate(zip(
             box_logits,
             objectness_logits,

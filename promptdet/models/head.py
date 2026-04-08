@@ -13,7 +13,7 @@ class PromptDetectHead(nn.Module):
     def __init__(self, channels: int, reg_max: int, prompt_dim: int, scales: List[str] | None = None):
         super().__init__()
         self.reg_max = reg_max
-        self.scales = scales or ["p3", "p4", "p5"]
+        self.scales = scales or ["p2", "p3", "p4", "p5"]
         self.prior_fuse = nn.ModuleDict()
         self.class_prior_fuse = nn.ModuleDict()
         self.box_heads = nn.ModuleDict()
@@ -47,7 +47,7 @@ class PromptDetectHead(nn.Module):
         self.one2one_objectness_heads = copy.deepcopy(self.objectness_heads)
         self.one2one_targetness_heads = copy.deepcopy(self.targetness_heads)
         self.one2one_class_heads = copy.deepcopy(self.class_heads)
-        self.strides = {"p3": 8, "p4": 16, "p5": 32}
+        self.strides = {"p2": 4, "p3": 8, "p4": 16, "p5": 32}
 
     def _forward_branch(
         self,
